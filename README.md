@@ -245,6 +245,34 @@ xift status
 | `in:node_modules lodash` | peek **inside** a folded dependency dir, on demand, no index pollution |
 | `all:kernel32` / `sys:` | lift the system-file demotion |
 
+### 🖥️ Desktop UI (`xift-ui`)
+
+Start the daemon first, then launch the unprivileged native GPU UI:
+
+```bash
+# 1. Start the local read-only daemon
+xift-daemon
+
+# 2. Launch the desktop search UI (Launcher + Explorer + Tray)
+xift-ui                 # starts in Launcher mode (default)
+xift-ui -mode explorer  # starts in multi-column Explorer mode
+xift-ui -mode tray      # starts resident in the system tray
+```
+
+| Binding | Action |
+| :--- | :--- |
+| `Alt+Space` | Global shortcut to focus/open **Launcher** quick-search panel |
+| `Ctrl+Alt+Space` | Global shortcut to focus/open **Explorer** multi-column window |
+| `↑` / `↓` | Move selection within retained search results |
+| `Enter` | Open selected file with default OS application |
+| `Ctrl+Enter` | Reveal selected file in OS file manager |
+| `Esc` | Hide window to tray (after 30 s hidden, the window worker exits to release GPU/driver memory while the tray host stays resident) |
+
+**Platform notes:**
+- **Windows**: Uses Win32 global hotkeys and notification-area tray. If another app holds a shortcut, Xift reports which binding failed and keeps the tray entry working.
+- **macOS**: Uses menu bar tray and Cocoa global hotkeys. Grant Accessibility / Input Monitoring permission if macOS restricts global shortcuts; conflicting bindings are surfaced in the window banner.
+- **Linux (X11 / Wayland)**: On X11, grabs keys directly; on Wayland, requests bindings through the `xdg-desktop-portal` GlobalShortcuts portal (declined or remapped bindings update the in-window notice). Tray uses StatusNotifierItem and falls back gracefully if no tray host is present.
+
 ### 🧰 Plays well with Unix
 
 ```bash
@@ -310,7 +338,8 @@ CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
 Xift/
 ├── cmd/
 │   ├── xift/              # CLI
-│   └── xift-daemon/       # background indexing daemon
+│   ├── xift-daemon/       # background indexing daemon
+│   └── xift-ui/           # MyGo native desktop UI (Launcher + Explorer)
 ├── internal/
 │   ├── filter/            # 3-level pruning & dependency folding
 │   ├── storage/           # columnar hot/cold storage, mmap, MemTable, WAL

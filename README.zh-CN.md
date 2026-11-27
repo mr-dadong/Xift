@@ -245,6 +245,34 @@ xift status
 | `in:node_modules lodash` | 按需**深入**被折叠的依赖目录检索，不污染常驻索引 |
 | `all:kernel32` / `sys:` | 解除系统文件降权 |
 
+### 🖥️ 桌面 UI（`xift-ui`）
+
+先启动本地只读守护进程，再以普通用户权限启动原生 GPU 桌面 UI：
+
+```bash
+# 1. 启动本地只读守护进程
+xift-daemon
+
+# 2. 启动桌面搜索 UI（Launcher 快搜窗 + Explorer 主窗 + 系统托盘）
+xift-ui                 # 默认以 Launcher 快搜窗启动
+xift-ui -mode explorer  # 以四列 Explorer 主窗启动
+xift-ui -mode tray      # 仅驻留系统托盘，按需唤起
+```
+
+| 快捷键 | 操作 |
+| :--- | :--- |
+| `Alt+Space` | 全局唤起 / 聚焦 **Launcher** 悬浮快搜窗 |
+| `Ctrl+Alt+Space` | 全局唤起 / 聚焦 **Explorer** 四列主窗 |
+| `↑` / `↓` | 在可浏览结果范围内上下选择 |
+| `Enter` | 使用系统默认应用打开所选文件 |
+| `Ctrl+Enter` | 在系统文件管理器中定位所选文件目录 |
+| `Esc` | 隐藏窗口到托盘（连续全隐藏满 30 秒后窗口渲染子进程自动退出，彻底归还 GPU 与显卡驱动内存，零 GPU 托盘宿主保持常驻） |
+
+**平台要求与说明：**
+- **Windows**：使用系统全局热键与通知区域托盘。若快捷键被其他软件占用，窗口会明确提示冲突绑定，托盘入口保持可用。
+- **macOS**：使用菜单栏托盘与系统全局快捷键。如遇系统权限限制或快捷键冲突，窗口提示条会明确展示受影响的绑定。
+- **Linux（X11 / Wayland）**：X11 下直接注册热键；Wayland 下通过 `xdg-desktop-portal` GlobalShortcuts 请求授权，用户拒绝或改键后状态提示会同步更新。托盘使用 StatusNotifierItem，无托盘宿主时自动降级保留窗口入口。
+
 ### 🧰 Unix 管道友好
 
 ```bash
@@ -310,7 +338,8 @@ CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
 Xift/
 ├── cmd/
 │   ├── xift/              # 命令行
-│   └── xift-daemon/       # 后台索引守护进程
+│   ├── xift-daemon/       # 后台索引守护进程
+│   └── xift-ui/           # MyGo 原生桌面 UI（Launcher + Explorer）
 ├── internal/
 │   ├── filter/            # 三级剪枝与依赖折叠
 │   ├── storage/           # 列式热冷存储、mmap、MemTable、WAL
