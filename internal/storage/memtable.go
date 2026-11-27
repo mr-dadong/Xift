@@ -195,9 +195,9 @@ func (m *MemTable) DeleteColdOverride(nodeID uint32) {
 	m.coldOverrides.Delete(nodeID)
 }
 
-func (m *MemTable) NodeAt(slotIdx uint32) HotNode   { return m.nodes[slotIdx] }
-func (m *MemTable) NodeIDAt(slotIdx uint32) uint32  { return m.nodeIDs[slotIdx] }
-func (m *MemTable) KeyAt(slotIdx uint32) uint64     { return m.keys[slotIdx] }
+func (m *MemTable) NodeAt(slotIdx uint32) HotNode  { return m.nodes[slotIdx] }
+func (m *MemTable) NodeIDAt(slotIdx uint32) uint32 { return m.nodeIDs[slotIdx] }
+func (m *MemTable) KeyAt(slotIdx uint32) uint64    { return m.keys[slotIdx] }
 func (m *MemTable) ColdMetaAt(slotIdx uint32) ColdMeta {
 	return ColdMeta{Size: m.sizes[slotIdx], ModTime: m.mtimes[slotIdx]}
 }

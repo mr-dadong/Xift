@@ -109,14 +109,14 @@ func TestPrunerUnorderedMFTSkeletonTwoPassAndHandoff(t *testing.T) {
 	})
 
 	// Deliberately unordered: children BEFORE parents + cycle + self-parent root
-	sb.AddDir(103, 102, "lodash")     // child of node_modules (before node_modules!)
-	sb.AddDir(104, 100, "coverage")   // ignored by project .gitignore
-	sb.AddDir(202, 201, "System32")   // under root Windows
-	sb.AddDir(302, 301, "GPUCache")   // hard exclude
-	sb.AddDir(303, 302, "index-dir")  // child of GPUCache
-	sb.AddDir(402, 401, "lib")        // deep user project "lib" (depth 3, must NOT be soft-demoted!)
-	sb.AddDir(900, 901, "cycleA")     // parent cycle A <-> B
-	sb.AddDir(901, 900, "cycleB")     // parent cycle B <-> A
+	sb.AddDir(103, 102, "lodash")    // child of node_modules (before node_modules!)
+	sb.AddDir(104, 100, "coverage")  // ignored by project .gitignore
+	sb.AddDir(202, 201, "System32")  // under root Windows
+	sb.AddDir(302, 301, "GPUCache")  // hard exclude
+	sb.AddDir(303, 302, "index-dir") // child of GPUCache
+	sb.AddDir(402, 401, "lib")       // deep user project "lib" (depth 3, must NOT be soft-demoted!)
+	sb.AddDir(900, 901, "cycleA")    // parent cycle A <-> B
+	sb.AddDir(901, 900, "cycleB")    // parent cycle B <-> A
 	sb.AddDir(102, 100, "node_modules")
 	sb.AddDir(100, 99, "app")
 	sb.AddDir(99, rootFRN, "work")
@@ -189,11 +189,11 @@ func TestPrunerInterceptNpmInstallStorm80K(t *testing.T) {
 	pruner := NewPruner(rules, nil)
 
 	const (
-		volID       uint16 = 1
-		projectKey  uint64 = 100
-		nodeModKey  uint64 = 101
-		numSubDirs         = 1000
-		totalFiles         = 79_999
+		volID      uint16 = 1
+		projectKey uint64 = 100
+		nodeModKey uint64 = 101
+		numSubDirs        = 1000
+		totalFiles        = 79_999
 	)
 
 	passed := 0
