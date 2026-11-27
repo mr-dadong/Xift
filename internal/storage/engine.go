@@ -52,6 +52,7 @@ type Engine struct {
 	segments         []*Segment // ordered oldest (base) -> newest (deltas)
 	mem              *MemTable
 	memShared        atomic.Bool // true when at least one Snapshot shares e.mem (CoW on next write)
+	writeGen         uint64      // monotonically incremented under e.mu.Lock on any mutation/segment change
 	dirByKey         *KeyMap
 	openStats        OpenStats
 }
@@ -288,6 +289,7 @@ func (e *Engine) CommitSegment(meta SegmentMeta, cursor *VolumeCursor) error {
 	// Post-MANIFEST commit: update in-memory state immediately so segIDs never collide, then rotate WAL.
 	e.manifest = nextManifest
 	e.segments = append(e.segments, seg)
+	e.writeGen++
 	if err := seg.PopulateDirMap(e.dirByKey); err != nil {
 		return err
 	}
@@ -328,6 +330,7 @@ func (e *Engine) ApplyBatch(muts []Mutation) error {
 			return err
 		}
 	}
+	e.writeGen++
 
 	if e.opts.AutoFlush && e.mem.EntryCount() >= e.opts.MemTableFlushThreshold {
 		return e.flushLocked()
@@ -882,6 +885,7 @@ func (e *Engine) Compact() error {
 	e.segments = []*Segment{newSeg}
 	e.dirByKey = newDirByKey
 	e.manifest = nextManifest
+	e.writeGen++
 	e.resetMemLocked()
 
 	for _, s := range oldSegs {
@@ -919,6 +923,7 @@ func (e *Engine) AcquireSnapshot() *Snapshot {
 	return &Snapshot{
 		segs: segs,
 		mem:  e.mem,
+		gen:  e.writeGen,
 	}
 }
 
@@ -1019,6 +1024,7 @@ func (e *Engine) Close() error {
 type Snapshot struct {
 	segs     []snapSegment
 	mem      *MemTable
+	gen      uint64
 	closed   bool
 	released atomic.Bool
 }
