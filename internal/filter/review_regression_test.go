@@ -413,3 +413,25 @@ func TestRegressionI10AndMinorsValidationAndConcurrentSave(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestRegressionNamelessDeleteAndModifyMetaUnderVisibleParent(t *testing.T) {
+	pruner := NewPruner(DefaultRuleEngine(), nil)
+	pruner.PrunedDirSet().Set(1, 99, DirFlagFoldedShell)
+
+	// Nameless Delete under visible parent MUST pass so Batcher can cancel Create+Delete or storage can delete by NodeKey.
+	if dec := pruner.InterceptEvent(EventInput{VolID: 1, Op: EventDelete, NodeKey: 500, ParentKey: 10}, nil); dec.Action != DecisionPass {
+		t.Fatalf("nameless Delete under visible parent = %v, want DecisionPass", dec.Action)
+	}
+	// Nameless ModifyMeta under visible parent MUST pass so cold metadata updates by NodeKey are not dropped.
+	if dec := pruner.InterceptEvent(EventInput{VolID: 1, Op: EventModifyMeta, NodeKey: 500, ParentKey: 10}, nil); dec.Action != DecisionPass {
+		t.Fatalf("nameless ModifyMeta under visible parent = %v, want DecisionPass", dec.Action)
+	}
+	// Nameless Delete under pruned parent MUST still be dropped.
+	if dec := pruner.InterceptEvent(EventInput{VolID: 1, Op: EventDelete, NodeKey: 501, ParentKey: 99}, nil); dec.Action != DecisionDrop {
+		t.Fatalf("nameless Delete under pruned parent = %v, want DecisionDrop", dec.Action)
+	}
+	// Nameless Create under visible parent MUST still be dropped.
+	if dec := pruner.InterceptEvent(EventInput{VolID: 1, Op: EventCreate, NodeKey: 502, ParentKey: 10}, nil); dec.Action != DecisionDrop {
+		t.Fatalf("nameless Create under visible parent = %v, want DecisionDrop", dec.Action)
+	}
+}
