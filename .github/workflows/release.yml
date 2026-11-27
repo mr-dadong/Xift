@@ -78,13 +78,13 @@ jobs:
           path: dist/xift_${{ needs.release-ready.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.*
           if-no-files-found: error
       - name: Upload bare binary artifact (for nfpm)
+        if: matrix.goos == 'linux'
         uses: actions/upload-artifact@v5
         with:
           # Deliberately no "-artifact" suffix: publish downloads pattern
           # '*-artifact' with merge-multiple, and two legs both named xift
           # would collide in the flattened download directory.
           name: bin-linux-${{ matrix.goarch }}
-          if: matrix.goos == 'linux'
           path: dist/xift
           if-no-files-found: error
 
