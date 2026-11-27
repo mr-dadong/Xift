@@ -1,0 +1,26 @@
+# nfpm packaging config for Xift deb/rpm packages.
+# ARCH and VERSION are injected as environment variables by the CI
+# packages job (nfpm expands ${VAR} in this file):
+#   ARCH=<amd64|arm64> VERSION=<tag-without-v> nfpm pkg -f <this file> ...
+# Contents paths (xift, LICENSE) are relative to the working directory
+# when running nfpm, which the CI job sets to the staging dir.
+name: xift
+arch: "${ARCH}"
+platform: linux
+version: "${VERSION}"
+version_schema: none
+maintainer: mr-dadong
+description: Xift - zero-CGO cross-platform high-performance file search engine
+homepage: https://github.com/mr-dadong/Xift
+license: Apache-2.0
+section: utils
+priority: optional
+contents:
+  - src: xift
+    dst: /usr/bin/xift
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/doc/xift/LICENSE
+    file_info:
+      mode: 0644

@@ -85,8 +85,48 @@ jobs:
           path: dist/xift
           if-no-files-found: error
 
-  publish:
+  packages:
     needs: [release-ready, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.release-ready.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install pinned nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
+      - name: Download linux binary artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: bin-linux-${{ matrix.goarch }}-artifact
+          path: pkg
+      - name: Build deb and rpm
+        run: |
+          arch="${{ matrix.goarch }}"
+          cp LICENSE pkg/LICENSE
+          cd pkg
+          chmod 0755 xift
+          ARCH="$arch" VERSION="${VERSION}" nfpm pkg -f ../.github/packaging/nfpm.yaml \
+            -p deb -t "xift_${VERSION}_linux_${arch}.deb"
+          ARCH="$arch" VERSION="${VERSION}" nfpm pkg -f ../.github/packaging/nfpm.yaml \
+            -p rpm -t "xift_${VERSION}_linux_${arch}.rpm"
+          sha256sum "xift_${VERSION}_linux_${arch}.deb" > "xift_${VERSION}_linux_${arch}.deb.sha256"
+          sha256sum "xift_${VERSION}_linux_${arch}.rpm" > "xift_${VERSION}_linux_${arch}.rpm.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pkg-linux-${{ matrix.goarch }}-artifact
+          path: pkg/xift_${{ needs.release-ready.outputs.version }}_linux_${{ matrix.goarch }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: [release-ready, build, packages]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -111,11 +151,18 @@ jobs:
               sha256sum -c "${f}.sha256"
             done
           done
+          for arch in amd64 arm64; do
+            for ext in deb rpm; do
+              f="xift_${VERSION}_linux_${arch}.${ext}"
+              [ -f "$f" ] || { echo "::error::missing $f"; ls -la; exit 1; }
+              sha256sum -c "${f}.sha256"
+            done
+          done
           rm -f xift xift.exe   # 裸二进制不入 Release
       - name: Generate checksums.txt
         run: |
           cd dist
-          sha256sum xift_${VERSION}_*.tar.gz xift_${VERSION}_*.zip > checksums.txt
+          sha256sum xift_${VERSION}_*.tar.gz xift_${VERSION}_*.zip xift_${VERSION}_*.deb xift_${VERSION}_*.rpm > checksums.txt
           cat checksums.txt
       - name: Create GitHub Release (idempotent)
         run: |
