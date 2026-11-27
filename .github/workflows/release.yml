@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Validate tag and derive version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$'; then
+              echo "::error::tag '$tag' does not match ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$"
+              exit 1
+            fi
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: release-ready
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, linux, darwin]
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.release-ready.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile xift (zero CGO)
+        run: |
+          bin="dist/xift"
+          [ "${{ matrix.goos }}" = "windows" ] && bin="dist/xift.exe"
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w" -o "$bin" ./cmd/xift
+      - name: Package portable archive
+        run: |
+          os="${{ matrix.goos }}"; arch="${{ matrix.goarch }}"; v="${VERSION}"
+          cd dist
+          # Go sets 0755 on Linux builds; chmod makes it explicit for all legs
+          # (zip stores unix modes in external attrs, so darwin extraction stays executable).
+          chmod 0755 xift$( [ "$os" = "windows" ] && echo ".exe" )
+          if [ "$os" = "linux" ]; then
+            asset="xift_${v}_${os}_${arch}.tar.gz"
+            tar -czf "$asset" xift
+            tar -tvf "$asset"   # log proof of exec bit
+          else
+            asset="xift_${v}_${os}_${arch}.zip"
+            zip -q "$asset" xift$( [ "$os" = "windows" ] && echo ".exe" )
+          fi
+          sha256sum "$asset" > "${asset}.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}-artifact
+          path: dist/xift_${{ needs.release-ready.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.*
+          if-no-files-found: error
+      - name: Upload bare binary artifact (for nfpm)
+        uses: actions/upload-artifact@v5
+        with:
+          name: bin-linux-${{ matrix.goarch }}-artifact
+          if: matrix.goos == 'linux'
+          path: dist/xift
+          if-no-files-found: error
