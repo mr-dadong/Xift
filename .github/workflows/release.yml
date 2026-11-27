@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Validate tag and derive version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$'; then
+              echo "::error::tag '$tag' does not match ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$"
+              exit 1
+            fi
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: release-ready
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, linux, darwin]
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ needs.release-ready.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile xift (zero CGO)
+        run: |
+          bin="dist/xift"
+          [ "${{ matrix.goos }}" = "windows" ] && bin="dist/xift.exe"
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w" -o "$bin" ./cmd/xift
+      - name: Package portable archive
+        run: |
+          os="${{ matrix.goos }}"; arch="${{ matrix.goarch }}"; v="${VERSION}"
+          cd dist
+          # Go sets 0755 on Linux builds; chmod makes it explicit for all legs
+          # (zip stores unix modes in external attrs, so darwin extraction stays executable).
+          chmod 0755 xift$( [ "$os" = "windows" ] && echo ".exe" )
+          if [ "$os" = "linux" ]; then
+            asset="xift_${v}_${os}_${arch}.tar.gz"
+            tar -czf "$asset" xift
+            tar -tvf "$asset"   # log proof of exec bit
+          else
+            asset="xift_${v}_${os}_${arch}.zip"
+            zip -q "$asset" xift$( [ "$os" = "windows" ] && echo ".exe" )
+          fi
+          sha256sum "$asset" > "${asset}.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}-artifact
+          path: dist/xift_${{ needs.release-ready.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}.*
+          if-no-files-found: error
+      - name: Upload bare binary artifact (for nfpm)
+        uses: actions/upload-artifact@v5
+        with:
+          # Deliberately no "-artifact" suffix: publish downloads pattern
+          # '*-artifact' with merge-multiple, and two legs both named xift
+          # would collide in the flattened download directory.
+          name: bin-linux-${{ matrix.goarch }}
+          if: matrix.goos == 'linux'
+          path: dist/xift
+          if-no-files-found: error
+
+  packages:
+    needs: [release-ready, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.release-ready.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install pinned nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.43.0
+      - name: Download linux binary artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: bin-linux-${{ matrix.goarch }}
+          path: pkg
+      - name: Build deb and rpm
+        run: |
+          arch="${{ matrix.goarch }}"
+          cp LICENSE pkg/LICENSE
+          cd pkg
+          chmod 0755 xift
+          ARCH="$arch" VERSION="${VERSION}" nfpm pkg -f ../.github/packaging/nfpm.yaml \
+            -p deb -t "xift_${VERSION}_linux_${arch}.deb"
+          ARCH="$arch" VERSION="${VERSION}" nfpm pkg -f ../.github/packaging/nfpm.yaml \
+            -p rpm -t "xift_${VERSION}_linux_${arch}.rpm"
+          sha256sum "xift_${VERSION}_linux_${arch}.deb" > "xift_${VERSION}_linux_${arch}.deb.sha256"
+          sha256sum "xift_${VERSION}_linux_${arch}.rpm" > "xift_${VERSION}_linux_${arch}.rpm.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pkg-linux-${{ matrix.goarch }}-artifact
+          path: pkg/xift_${{ needs.release-ready.outputs.version }}_linux_${{ matrix.goarch }}.*
+          if-no-files-found: error
+
+  publish:
+    needs: [release-ready, build, packages]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ needs.release-ready.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: '*-artifact'
+          merge-multiple: true
+          path: dist
+      - name: Verify expected assets present
+        run: |
+          cd dist
+          for os in windows linux darwin; do
+            for arch in amd64 arm64; do
+              ext="zip"; [ "$os" = "linux" ] && ext="tar.gz"
+              f="xift_${VERSION}_${os}_${arch}.${ext}"
+              [ -f "$f" ] || { echo "::error::missing $f"; ls -la; exit 1; }
+              sha256sum -c "${f}.sha256"
+            done
+          done
+          for arch in amd64 arm64; do
+            for ext in deb rpm; do
+              f="xift_${VERSION}_linux_${arch}.${ext}"
+              [ -f "$f" ] || { echo "::error::missing $f"; ls -la; exit 1; }
+              sha256sum -c "${f}.sha256"
+            done
+          done
+      - name: Generate checksums.txt
+        run: |
+          cd dist
+          sha256sum xift_${VERSION}_*.tar.gz xift_${VERSION}_*.zip xift_${VERSION}_*.deb xift_${VERSION}_*.rpm > checksums.txt
+          cat checksums.txt
+      - name: Create GitHub Release (idempotent)
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --generate-notes --title "Xift ${tag}"
+          fi
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" dist/xift_${VERSION}_* dist/checksums.txt --clobber
