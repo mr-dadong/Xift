@@ -511,3 +511,64 @@ func (s *SearchController) notify() {
 		s.onChange()
 	}
 }
+
+type recordOpenClient interface {
+	RecordOpen(ctx context.Context, path string) error
+}
+
+type filterRuleClient interface {
+	ApplyFilterRule(ctx context.Context, action uint8, targetPath string, nodeID uint32, volID uint16) (uint32, error)
+}
+
+// RecordOpen asynchronously notifies the Daemon that path was opened/revealed so Frecency updates.
+func (s *SearchController) RecordOpen(path string) {
+	if s == nil || path == "" {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), s.requestTimeout)
+		defer cancel()
+		cli, err := s.ensureClient(ctx)
+		if err != nil || cli == nil {
+			return
+		}
+		if rc, ok := cli.(recordOpenClient); ok {
+			_ = rc.RecordOpen(ctx, path)
+		}
+	}()
+}
+
+// ApplyFilterRule asynchronously sends a Fold or HardExclude rule to the Daemon and invokes onDone.
+func (s *SearchController) ApplyFilterRule(action uint8, targetPath string, nodeID uint32, volID uint16, onDone func(affected uint32, err error)) {
+	if s == nil || targetPath == "" {
+		if onDone != nil {
+			onDone(0, errors.New("invalid filter rule target"))
+		}
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), s.requestTimeout)
+		defer cancel()
+		cli, err := s.ensureClient(ctx)
+		if err != nil || cli == nil {
+			if onDone != nil {
+				if err == nil {
+					err = errors.New("not connected to daemon")
+				}
+				onDone(0, err)
+			}
+			return
+		}
+		fc, ok := cli.(filterRuleClient)
+		if !ok {
+			if onDone != nil {
+				onDone(0, errors.New("daemon client does not support filter rules"))
+			}
+			return
+		}
+		affected, err := fc.ApplyFilterRule(ctx, action, targetPath, nodeID, volID)
+		if onDone != nil {
+			onDone(affected, err)
+		}
+	}()
+}

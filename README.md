@@ -264,8 +264,11 @@ xift-ui -mode tray      # starts resident in the system tray
 | `Alt+Space` | Global shortcut to focus/open **Launcher** quick-search panel |
 | `Ctrl+Alt+Space` | Global shortcut to focus/open **Explorer** multi-column window |
 | `↑` / `↓` | Move selection within retained search results |
-| `Enter` | Open selected file with default OS application |
-| `Ctrl+Enter` | Reveal selected file in OS file manager |
+| `Enter` | Open selected file with default OS application (also records Frecency) |
+| `Ctrl+Enter` | Reveal selected file in OS file manager (also records Frecency) |
+| `Tab` | Toggle non-blocking split preview pane (code/text, Markdown, images, `.zip`/`.tar.gz`, PDF metadata) |
+| `Right-Click` | Open native context menu (Open, Reveal, Copy Path/Name, Preview, Fold Parent Dir, Exclude Path) |
+| `Drag` | Drag a result row directly into external desktop apps |
 | `Esc` | Hide window to tray (after 30 s hidden, the window worker exits to release GPU/driver memory while the tray host stays resident) |
 
 **Platform notes:**
@@ -311,7 +314,7 @@ xift --daemon ext:go --limit 50                      # query the running daemon 
 | :--- | :--- | :-: |
 | **0 · Spike** | MyGo `ui.List` 3M-row stress demo · Pure Go MFT scan + two-pass pruning | ✅ |
 | **1 · Tier 1 engine** | Columnar storage + `mmap` + MemTable + WAL · 3-level pruner · 3 OS providers · 150 ms batcher · query DSL · CLI | ✅ |
-| **2 · Native UI** | Secure IPC & viewport RPC · Launcher + Explorer windows · Fuzzy / Pinyin / Frecency · icon atlas · native context menu & drag-out · previews | 🚧 |
+| **2 · Native UI** | Secure IPC & viewport RPC · Launcher + Explorer windows · Fuzzy / Pinyin / Frecency · icon atlas · native context menu & drag-out · previews | ✅ |
 | **3 · 100M+ & ecosystem** | Tier 2 LSM + Trigram + fixed-budget LRU · full-text for whitelisted dirs · offline volume snapshots · MCP server | 🔭 |
 
 ---

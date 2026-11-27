@@ -2,9 +2,13 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/mr-dadong/Xift/internal/filter"
 	"github.com/mr-dadong/Xift/internal/ipc"
 	"github.com/mr-dadong/Xift/internal/query"
 	"github.com/mr-dadong/Xift/internal/storage"
@@ -42,8 +46,29 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer store.Close()
 
-	qe := query.NewEngine(store)
-	backend := ipc.NewQueryBackend(store, qe)
+	indexDir := filepath.Join(dataDir, "index")
+	frecencyStore, err := query.OpenFrecencyStore(filepath.Join(indexDir, "frecency.db"), query.FrecencyOptions{})
+	if err != nil {
+		_ = ln.Close()
+		return fmt.Errorf("daemon: open frecency store: %w", err)
+	}
+	defer frecencyStore.Close()
+
+	rulesPath := filepath.Join(indexDir, "rules.json")
+	ruleEng := filter.DefaultRuleEngine()
+	if err := ruleEng.LoadUserRules(rulesPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Log-free graceful degradation: keep defaults if rules file cannot be loaded.
+		ruleEng = filter.DefaultRuleEngine()
+	}
+	pruner := filter.NewPruner(ruleEng, nil)
+
+	qe := query.NewEngine(store, query.WithFrecency(frecencyStore))
+	backend := ipc.NewQueryBackend(
+		store,
+		qe,
+		ipc.WithFrecencyStore(frecencyStore),
+		ipc.WithPruner(pruner, rulesPath),
+	)
 	srv := ipc.NewServer(backend, cfg.ServerOptions)
 
 	serveErrCh := make(chan error, 1)

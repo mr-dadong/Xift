@@ -9,6 +9,9 @@ import (
 	"github.com/egoist/mygo/ui"
 	"github.com/mr-dadong/Xift/internal/ipc"
 	"github.com/mr-dadong/Xift/internal/query"
+	"github.com/mr-dadong/Xift/internal/storage"
+	"github.com/mr-dadong/Xift/internal/ui/icons"
+	"github.com/mr-dadong/Xift/internal/ui/preview"
 )
 
 // FileOpener performs ordinary-user file operations on selected search results.
@@ -31,12 +34,14 @@ type AppConfig struct {
 }
 
 // App coordinates the single shared SearchController, Lifecycle state machine,
-// and the Launcher / Explorer MyGo views.
+// icon Atlas, non-blocking Preview manager, and the Launcher / Explorer MyGo views.
 type App struct {
 	host           WindowHost
 	opener         FileOpener
 	search         *SearchController
 	lifecycle      *Lifecycle
+	icons          *icons.Atlas
+	previewMgr     *preview.Manager
 	onQueryChanged func(string)
 	onHidden       func()
 
@@ -49,6 +54,13 @@ type App struct {
 	sortDesc             bool
 	selectedIdx          int
 	focusSearchNextFrame bool
+	previewOpen          bool
+	lastPreviewPath      string
+	lastVisFirst         int
+	lastVisLast          int
+	lastVisSessionID     uint64
+	lastVisPageOffset    uint32
+	lastVisRowCount      int
 	shortcutWarnings     []string
 	statusMsg            string
 	listState            ui.ListState
@@ -61,19 +73,33 @@ func NewApp(cfg AppConfig) *App {
 		opener:         cfg.Opener,
 		sortOrder:      uint8(query.SortByRelevance),
 		selectedIdx:    -1,
+		lastVisFirst:   -1,
+		lastVisLast:    -1,
 		onQueryChanged: cfg.OnQueryChanged,
 		onHidden:       cfg.OnHidden,
 	}
 	a.listState.RowHeight = 30
+
+	invalidate := func() {
+		if a.host != nil {
+			a.host.Invalidate()
+		}
+	}
+
+	a.icons = icons.NewAtlas(icons.Config{
+		OnReady: invalidate,
+	})
+	a.previewMgr = preview.NewManager(preview.Config{
+		OnReady: invalidate,
+	})
 
 	a.search = NewSearchController(SearchConfig{
 		Dial:     cfg.Dial,
 		PageSize: cfg.PageSize,
 		PathSep:  cfg.PathSep,
 		OnChange: func() {
-			if a.host != nil {
-				a.host.Invalidate()
-			}
+			a.syncPreviewForSelection()
+			invalidate()
 		},
 	})
 
@@ -108,6 +134,16 @@ func NewApp(cfg AppConfig) *App {
 			},
 			OnReclaimResources: func() {
 				a.search.Disconnect()
+				a.icons.Clear()
+				a.previewMgr.Clear()
+				a.mu.Lock()
+				a.lastPreviewPath = ""
+				a.lastVisFirst = -1
+				a.lastVisLast = -1
+				a.lastVisSessionID = 0
+				a.lastVisPageOffset = 0
+				a.lastVisRowCount = 0
+				a.mu.Unlock()
 				if a.host != nil {
 					a.host.Destroy()
 				}
@@ -147,6 +183,72 @@ func (a *App) HandleEscape() {
 func (a *App) Quit() {
 	a.lifecycle.Quit()
 	a.search.Close()
+	a.icons.Close()
+	a.previewMgr.Close()
+}
+
+// TogglePreview toggles the non-blocking right-hand preview pane.
+func (a *App) TogglePreview() {
+	a.mu.Lock()
+	a.previewOpen = !a.previewOpen
+	open := a.previewOpen
+	if !open {
+		a.lastPreviewPath = ""
+	}
+	a.mu.Unlock()
+
+	if !open {
+		a.previewMgr.Clear()
+	} else {
+		a.syncPreviewForSelection()
+	}
+	if a.host != nil {
+		a.host.Invalidate()
+	}
+}
+
+// PreviewOpen reports whether the split preview pane is currently visible.
+func (a *App) PreviewOpen() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.previewOpen
+}
+
+// PreviewSnapshot returns the latest non-blocking preview snapshot.
+func (a *App) PreviewSnapshot() preview.Result {
+	return a.previewMgr.Snapshot()
+}
+
+// IconStats returns the current cached extension and per-file icon counts.
+func (a *App) IconStats() (int, int) {
+	return a.icons.Stats()
+}
+
+func (a *App) syncPreviewForSelection() {
+	if !a.PreviewOpen() {
+		return
+	}
+	row, ok := a.selectedRow()
+	a.mu.Lock()
+	if !ok {
+		if a.lastPreviewPath != "" {
+			a.lastPreviewPath = ""
+			a.mu.Unlock()
+			a.previewMgr.Clear()
+			return
+		}
+		a.mu.Unlock()
+		return
+	}
+	if row.Path == a.lastPreviewPath {
+		a.mu.Unlock()
+		return
+	}
+	a.lastPreviewPath = row.Path
+	a.mu.Unlock()
+
+	isDir := (row.Flags & storage.FlagDir) != 0
+	a.previewMgr.Select(row.Path, isDir)
 }
 
 // ActiveMode returns the currently visible window mode.
@@ -272,12 +374,15 @@ func (a *App) SearchSnapshot() SearchSnapshot {
 func (a *App) SelectRow(idx int) {
 	snap := a.search.Snapshot()
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	if idx < 0 || uint32(idx) >= snap.Retained {
 		a.selectedIdx = -1
+		a.mu.Unlock()
+		a.syncPreviewForSelection()
 		return
 	}
 	a.selectedIdx = idx
+	a.mu.Unlock()
+	a.syncPreviewForSelection()
 }
 
 // ClearSelection clears the active row selection.
@@ -326,6 +431,7 @@ func (a *App) MoveSelection(delta int) {
 
 	a.listState.ScrollTo(cur, ui.Center)
 	a.ensureIndexLoaded(snap, cur)
+	a.syncPreviewForSelection()
 	if a.host != nil {
 		a.host.Invalidate()
 	}
@@ -361,6 +467,7 @@ func (a *App) OpenSelected() error {
 		a.setStatus("打开失败: " + err.Error())
 	} else {
 		a.setStatus("已打开: " + row.Name)
+		a.search.RecordOpen(row.Path)
 	}
 	return err
 }
@@ -377,6 +484,7 @@ func (a *App) RevealSelected() error {
 		a.setStatus("定位失败: " + err.Error())
 	} else {
 		a.setStatus("已定位: " + filepath.Dir(row.Path))
+		a.search.RecordOpen(row.Path)
 	}
 	return err
 }
@@ -472,6 +580,44 @@ func (a *App) registerCommonShortcuts(c *ui.Context) {
 	c.OnWindowShortcut(ui.Ctrl, ui.KeyEnter, func() {
 		_ = a.RevealSelected()
 	})
+	c.OnWindowShortcut(0, ui.KeyTab, func() {
+		a.TogglePreview()
+	})
+}
+
+func (a *App) notifyVisibleIcons(snap SearchSnapshot, firstVis, lastVis int) {
+	if len(snap.Rows) == 0 || snap.Retained == 0 || firstVis < 0 {
+		return
+	}
+	a.mu.Lock()
+	if firstVis == a.lastVisFirst &&
+		lastVis == a.lastVisLast &&
+		snap.SessionID == a.lastVisSessionID &&
+		snap.PageOffset == a.lastVisPageOffset &&
+		len(snap.Rows) == a.lastVisRowCount {
+		a.mu.Unlock()
+		return
+	}
+	a.lastVisFirst = firstVis
+	a.lastVisLast = lastVis
+	a.lastVisSessionID = snap.SessionID
+	a.lastVisPageOffset = snap.PageOffset
+	a.lastVisRowCount = len(snap.Rows)
+	a.mu.Unlock()
+
+	end := lastVis
+	if end >= int(snap.Retained) {
+		end = int(snap.Retained) - 1
+	}
+	var perFile []string
+	for i := firstVis; i <= end; i++ {
+		if row, ok := snap.RowAt(i); ok && (row.Flags&storage.FlagDir) == 0 {
+			if icons.SupportsPerFileIcon(filepath.Ext(row.Name)) && row.Path != "" {
+				perFile = append(perFile, row.Path)
+			}
+		}
+	}
+	a.icons.NotifyVisible(perFile)
 }
 
 func formatSize(size int64, isDir bool) string {

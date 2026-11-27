@@ -5,7 +5,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
+	"github.com/mr-dadong/Xift/internal/storage"
+	"github.com/mr-dadong/Xift/internal/ui/platform"
 )
 
 func (a *App) renderLauncher(c *ui.Context) {
@@ -16,6 +19,7 @@ func (a *App) renderLauncher(c *ui.Context) {
 	wantFocus := a.focusSearchNextFrame
 	a.focusSearchNextFrame = false
 	selIdx := a.selectedIdx
+	previewOpen := a.previewOpen
 	warnings := append([]string(nil), a.shortcutWarnings...)
 	statusMsg := a.statusMsg
 	a.mu.Unlock()
@@ -35,15 +39,23 @@ func (a *App) renderLauncher(c *ui.Context) {
 
 	firstVis, lastVis := a.listState.Visible()
 	a.EnsureViewportLoaded(snap, firstVis, lastVis)
+	a.notifyVisibleIcons(snap, firstVis, lastVis)
 
 	ui.Column(c).Fill().Padding(14).Gap(10).Background(ui.Hex("#14171f")).Children(func() {
 		// Search bar
 		ui.Row(c).FillWidth().Gap(8).Children(func() {
 			input := ui.TextInput(c, &a.uiQueryBuf).
-				Placeholder("搜索文件（支持中文与 DSL，如：报告 ext:pdf）").
+				Placeholder("搜索文件（支持中文/拼音/Fuzzy 与 DSL，如：wdjg ext:md）").
 				Grow(1)
 			if wantFocus {
 				input.Focus()
+			}
+			previewBtn := "预览"
+			if previewOpen {
+				previewBtn = "收起预览"
+			}
+			if ui.Button(c, previewBtn).Clicked() {
+				a.TogglePreview()
 			}
 			if ui.Button(c, "在 Explorer 中打开").Clicked() {
 				a.syncUIQueryAfterRender()
@@ -74,43 +86,73 @@ func (a *App) renderLauncher(c *ui.Context) {
 			})
 		}
 
-		// Virtualized result list bounded strictly by snap.Retained
-		if count == 0 {
-			emptyText := "输入关键词以实时搜索本地索引"
-			if snap.Loading {
-				emptyText = "正在查询..."
-			} else if snap.QueryText != "" && snap.Error == "" && !snap.Disconnected {
-				emptyText = "未找到匹配文件"
-			}
-			ui.Column(c).Fill().Grow(1).Padding(24).Children(func() {
-				ui.Text(c, emptyText).FontSize(13).TextColor(ui.Hex("#9ca3af"))
-			})
-		} else {
-			ui.List(c, &a.listState, count, func(i int) {
-				row, ok := snap.RowAt(i)
-				bg := ui.Hex("#14171f")
-				if i == selIdx {
-					bg = ui.Hex("#254b73")
-				} else if i%2 == 1 {
-					bg = ui.Hex("#191d27")
+		// Main body: virtualized result list + optional non-blocking preview pane
+		ui.Row(c).Fill().Grow(1).Gap(10).Children(func() {
+			if count == 0 {
+				emptyText := "输入关键词以实时搜索本地索引"
+				if snap.Loading {
+					emptyText = "正在查询..."
+				} else if snap.QueryText != "" && snap.Error == "" && !snap.Disconnected {
+					emptyText = "未找到匹配文件"
 				}
-
-				r := ui.Row(c).FillWidth().Height(30).Padding(0, 10).Gap(10).Background(bg).Children(func() {
-					if !ok {
-						ui.Text(c, "加载中...").FontSize(12).TextColor(ui.Hex("#6b7280")).SingleLine()
-						return
-					}
-					ui.Text(c, row.Name).Width(260).FontSize(13).TextColor(ui.Hex("#f3f4f6")).SingleLine()
-					ui.Text(c, filepath.Dir(row.Path)).Grow(1).FontSize(12).TextColor(ui.Hex("#9ca3af")).SingleLine()
+				ui.Column(c).Fill().Grow(1).Padding(24).Children(func() {
+					ui.Text(c, emptyText).FontSize(13).TextColor(ui.Hex("#9ca3af"))
 				})
-				if r.RowClicked() {
-					a.SelectRow(i)
-				}
-			}).Fill().Grow(1)
-		}
+			} else {
+				ui.List(c, &a.listState, count, func(i int) {
+					row, ok := snap.RowAt(i)
+					bg := ui.Hex("#14171f")
+					if i == selIdx {
+						bg = ui.Hex("#254b73")
+					} else if i%2 == 1 {
+						bg = ui.Hex("#191d27")
+					}
+
+					r := ui.Row(c).FillWidth().Height(30).Padding(0, 10).Gap(8).Background(bg).Children(func() {
+						if !ok {
+							ui.Text(c, "加载中...").FontSize(12).TextColor(ui.Hex("#6b7280")).SingleLine()
+							return
+						}
+						isDir := (row.Flags & storage.FlagDir) != 0
+						if bmp := a.icons.IconFor(row.Name, row.Path, isDir); bmp != nil {
+							ui.Image(c, bmp).Size(18, 18)
+						}
+						spans := BuildHighlightSpans(row.Name, row.Highlights, ui.Hex("#f3f4f6"), ui.Hex("#fde047"), ui.Hex("#422006"))
+						ui.RichText(c, spans...).Width(240).FontSize(13).SingleLine()
+						ui.Text(c, filepath.Dir(row.Path)).Grow(1).FontSize(12).TextColor(ui.Hex("#9ca3af")).SingleLine()
+					})
+					if ok {
+						if cleanPath, err := platform.ValidateAbsolutePath(row.Path); err == nil {
+							dragPath := cleanPath
+							r.DragDataFrom(func() transfer.Data {
+								d, err := transfer.FileData(dragPath)
+								if err != nil {
+									return transfer.Data{}
+								}
+								return d
+							})
+						}
+					}
+					if r.RowClicked() {
+						a.SelectRow(i)
+					}
+					if r.RowDoubleClicked() {
+						a.SelectRow(i)
+						_ = a.OpenSelected()
+					}
+					if r.RightClicked() {
+						a.ShowContextMenuForRow(i)
+					}
+				}).Fill().Grow(1)
+			}
+
+			if previewOpen {
+				renderPreviewPane(c, a.previewMgr.Snapshot())
+			}
+		})
 
 		// Compact status / shortcut hint footer
-		footer := fmt.Sprintf("↑/↓ 选择 · Enter 打开 · Ctrl+Enter 定位目录 · Esc 隐藏")
+		footer := fmt.Sprintf("↑/↓ 选择 · Enter 打开 · Ctrl+Enter 定位 · Tab 预览 · 右键菜单 · Esc 隐藏")
 		if snap.Retained > 0 {
 			if snap.Truncated {
 				footer = fmt.Sprintf("可浏览 %d / 共 %d 条（已截断） · %s", snap.Retained, snap.Total, footer)

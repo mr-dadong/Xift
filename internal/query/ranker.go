@@ -43,6 +43,10 @@ func (e *Engine) rankCandidates(
 
 	// Compute initial scores cheaply without cold reads or full path resolution.
 	computeDepth := total <= exactDepthCutoff && opts.Sort == SortByRelevance
+	useFrecency := e.frecency != nil
+	if fs, ok := e.frecency.(*FrecencyStore); ok && !fs.HasEntries() {
+		useFrecency = false
+	}
 	for i := range cands {
 		c := &cands[i]
 		score := c.bestTier.Score()
@@ -56,8 +60,12 @@ func (e *Engine) rankCandidates(
 			// Lightweight tie-breaker favoring shorter basenames before Top-K refinement.
 			score += 10.0 / float64(int(c.nameLen)+1)
 		}
-		if e.frecency != nil {
-			score += e.frecency.Score(c.nodeID, "")
+		if useFrecency {
+			var p string
+			if computeDepth {
+				p, _ = snap.ResolvePathWithSep(c.nodeID, opts.PathSep)
+			}
+			score += e.frecency.Score(c.nodeID, p)
 		}
 		c.score = score
 	}
@@ -70,7 +78,7 @@ func (e *Engine) rankCandidates(
 	var kept []candidate
 	switch opts.Sort {
 	case SortByRelevance:
-		kept = selectTopK(cands, maxRetained, func(a, b candidate) int {
+		cmpRelevance := func(a, b candidate) int {
 			if a.score > b.score {
 				return -1
 			}
@@ -84,7 +92,34 @@ func (e *Engine) rankCandidates(
 				return 1
 			}
 			return 0
-		})
+		}
+		kept = selectTopK(cands, maxRetained, cmpRelevance)
+		// When total exceeded exactDepthCutoff, refine the top bounded prefix with exact
+		// depth and path-based Frecency scores so broad queries still honor Frecency.
+		if !computeDepth && useFrecency && len(kept) > 0 {
+			refineN := len(kept)
+			if refineN > exactDepthCutoff {
+				refineN = exactDepthCutoff
+			}
+			for i := 0; i < refineN; i++ {
+				if (i & ctxCheckIntervalMask) == 0 {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+				}
+				c := &kept[i]
+				score := c.bestTier.Score()
+				if !plan.includeSystem && (c.flags&storage.FlagSystem) != 0 {
+					score -= systemDemotePenalty
+				}
+				depth := nodeDepth(snap, c.nodeID)
+				score += depthWeight / float64(depth+1)
+				p, _ := snap.ResolvePathWithSep(c.nodeID, opts.PathSep)
+				score += e.frecency.Score(c.nodeID, p)
+				c.score = score
+			}
+			kept = selectTopK(kept, maxRetained, cmpRelevance)
+		}
 	case SortByName:
 		kept = selectTopK(cands, maxRetained, func(a, b candidate) int {
 			_, na, _ := snap.LookupNode(a.nodeID)
@@ -189,8 +224,8 @@ func computeHighlights(name []byte, nonASCII bool, posNames []compiledAtom) []Hi
 	var ranges []HighlightRange
 	for i := range posNames {
 		ca := &posNames[i]
-		if tier, s, e := MatchName(name, nonASCII, ca.needleBytes, ca.atom.Value); tier != TierNone && e > s {
-			ranges = append(ranges, HighlightRange{Start: s, End: e})
+		if tier, rs := MatchNameHighlights(name, nonASCII, ca.needleBytes, ca.atom.Value); tier != TierNone && len(rs) > 0 {
+			ranges = append(ranges, rs...)
 		}
 	}
 	return MergeHighlights(ranges)

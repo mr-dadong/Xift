@@ -18,6 +18,8 @@ type MatchTier uint8
 const (
 	TierNone MatchTier = iota
 	TierWildcard
+	TierFuzzy
+	TierPinyin
 	TierSubstring
 	TierWordBoundary
 	TierPrefix
@@ -35,11 +37,50 @@ func (t MatchTier) Score() float64 {
 		return 550
 	case TierSubstring:
 		return 350
+	case TierPinyin:
+		return 260
+	case TierFuzzy:
+		return 180
 	case TierWildcard:
-		return 300
+		return 150
 	default:
 		return 0
 	}
+}
+
+// MatchNameWithFallback tries direct substring matching first (zero-alloc for ASCII),
+// then falls back to Mandarin Pinyin initials (for non-ASCII names with ASCII queries)
+// and finally ordered discrete Fuzzy subsequence matching (for queries of length >= 2).
+func MatchNameWithFallback(name []byte, isNonASCII bool, needleLower []byte, needleLowerStr string) MatchTier {
+	if tier, _, _ := MatchName(name, isNonASCII, needleLower, needleLowerStr); tier != TierNone {
+		return tier
+	}
+	if isNonASCII && isAllASCII(needleLower) && MatchPinyinFast(name, needleLower) {
+		return TierPinyin
+	}
+	if len(needleLower) >= 2 && MatchFuzzyFast(name, isNonASCII, needleLower, needleLowerStr) {
+		return TierFuzzy
+	}
+	return TierNone
+}
+
+// MatchNameHighlights computes the best MatchTier and exact UTF-8 byte HighlightRanges
+// across direct substring, Mandarin Pinyin initials, and Fuzzy subsequence matching.
+func MatchNameHighlights(name []byte, isNonASCII bool, needleLower []byte, needleLowerStr string) (MatchTier, []HighlightRange) {
+	if tier, s, e := MatchName(name, isNonASCII, needleLower, needleLowerStr); tier != TierNone && e > s {
+		return tier, []HighlightRange{{Start: s, End: e}}
+	}
+	if isNonASCII && isAllASCII(needleLower) {
+		if tier, ranges := MatchPinyin(name, needleLowerStr); tier != TierNone {
+			return tier, ranges
+		}
+	}
+	if len(needleLower) >= 2 {
+		if tier, ranges := MatchFuzzy(name, isNonASCII, needleLower, needleLowerStr); tier != TierNone {
+			return tier, ranges
+		}
+	}
+	return TierNone, nil
 }
 
 func asciiLower(b byte) byte {

@@ -32,16 +32,26 @@ const (
 type MsgType uint8
 
 const (
-	MsgHello           MsgType = 1
-	MsgHelloAck        MsgType = 2
-	MsgQueryStart      MsgType = 3
-	MsgQueryResultMeta MsgType = 4
-	MsgFetchViewport   MsgType = 5
-	MsgViewportRows    MsgType = 6
-	MsgCancel          MsgType = 7
-	MsgStatus          MsgType = 8
-	MsgStatusReply     MsgType = 9
-	MsgError           MsgType = 10
+	MsgHello              MsgType = 1
+	MsgHelloAck           MsgType = 2
+	MsgQueryStart         MsgType = 3
+	MsgQueryResultMeta    MsgType = 4
+	MsgFetchViewport      MsgType = 5
+	MsgViewportRows       MsgType = 6
+	MsgCancel             MsgType = 7
+	MsgStatus             MsgType = 8
+	MsgStatusReply        MsgType = 9
+	MsgError              MsgType = 10
+	MsgRecordOpen         MsgType = 11
+	MsgRecordOpenAck      MsgType = 12
+	MsgApplyFilterRule    MsgType = 13
+	MsgApplyFilterRuleAck MsgType = 14
+)
+
+// FilterRuleAction values carried in ApplyFilterRuleReq.Action.
+const (
+	FilterActionFold        uint8 = 1
+	FilterActionHardExclude uint8 = 2
 )
 
 // ErrCode classifies protocol and RPC errors returned in ErrorResp.
@@ -202,6 +212,27 @@ type StatusReply struct {
 type ErrorResp struct {
 	Code    ErrCode
 	Message string
+}
+
+// RecordOpenReq notifies the Daemon that a user opened or revealed a result path.
+type RecordOpenReq struct {
+	Path string
+}
+
+// RecordOpenAck acknowledges a RecordOpenReq.
+type RecordOpenAck struct{}
+
+// ApplyFilterRuleReq requests dynamically folding or hard-excluding a directory or path.
+type ApplyFilterRuleReq struct {
+	Action     uint8
+	TargetPath string
+	NodeID     uint32
+	VolID      uint16
+}
+
+// ApplyFilterRuleAck reports how many indexed nodes were affected by ApplyFilterRuleReq.
+type ApplyFilterRuleAck struct {
+	AffectedCount uint32
 }
 
 // DecodeFrameHeader parses a 12-byte frame header and enforces magic and MaxPayloadLen.
@@ -383,6 +414,27 @@ func EncodeMessage(msg any) (MsgType, []byte, error) {
 		b = binary.LittleEndian.AppendUint16(b, uint16(m.Code))
 		b = appendString(b, m.Message)
 		return MsgError, b, nil
+
+	case *RecordOpenReq:
+		b = make([]byte, 0, 8+len(m.Path))
+		b = appendString(b, m.Path)
+		return MsgRecordOpen, b, nil
+
+	case *RecordOpenAck:
+		return MsgRecordOpenAck, nil, nil
+
+	case *ApplyFilterRuleReq:
+		b = make([]byte, 0, 16+len(m.TargetPath))
+		b = append(b, m.Action)
+		b = binary.LittleEndian.AppendUint32(b, m.NodeID)
+		b = binary.LittleEndian.AppendUint16(b, m.VolID)
+		b = appendString(b, m.TargetPath)
+		return MsgApplyFilterRule, b, nil
+
+	case *ApplyFilterRuleAck:
+		b = make([]byte, 0, 4)
+		b = binary.LittleEndian.AppendUint32(b, m.AffectedCount)
+		return MsgApplyFilterRuleAck, b, nil
 
 	default:
 		return 0, nil, fmt.Errorf("ipc: unsupported message type %T", msg)
@@ -687,6 +739,59 @@ func DecodeMessage(msgType MsgType, payload []byte) (any, error) {
 			return nil, err
 		}
 		return &ErrorResp{Code: ErrCode(code), Message: msg}, nil
+
+	case MsgRecordOpen:
+		p, err := d.str()
+		if err != nil {
+			return nil, err
+		}
+		if err := d.done(); err != nil {
+			return nil, err
+		}
+		return &RecordOpenReq{Path: p}, nil
+
+	case MsgRecordOpenAck:
+		if err := d.done(); err != nil {
+			return nil, err
+		}
+		return &RecordOpenAck{}, nil
+
+	case MsgApplyFilterRule:
+		act, err := d.u8()
+		if err != nil {
+			return nil, err
+		}
+		nid, err := d.u32()
+		if err != nil {
+			return nil, err
+		}
+		vid, err := d.u16()
+		if err != nil {
+			return nil, err
+		}
+		tp, err := d.str()
+		if err != nil {
+			return nil, err
+		}
+		if err := d.done(); err != nil {
+			return nil, err
+		}
+		return &ApplyFilterRuleReq{
+			Action:     act,
+			NodeID:     nid,
+			VolID:      vid,
+			TargetPath: tp,
+		}, nil
+
+	case MsgApplyFilterRuleAck:
+		cnt, err := d.u32()
+		if err != nil {
+			return nil, err
+		}
+		if err := d.done(); err != nil {
+			return nil, err
+		}
+		return &ApplyFilterRuleAck{AffectedCount: cnt}, nil
 
 	default:
 		return nil, fmt.Errorf("%w: unknown message type %d", ErrMalformedFrame, msgType)

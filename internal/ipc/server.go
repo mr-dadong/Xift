@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -75,6 +76,16 @@ type SessionBackend interface {
 type Backend interface {
 	NewSession() SessionBackend
 	Status() BackendStatus
+}
+
+// FrecencyRecorder is an optional Backend extension that records user open events.
+type FrecencyRecorder interface {
+	RecordOpen(ctx context.Context, path string) error
+}
+
+// FilterRuleApplier is an optional Backend extension that applies dynamic Fold/HardExclude rules.
+type FilterRuleApplier interface {
+	ApplyFilterRule(ctx context.Context, req ApplyFilterRuleReq) (uint32, error)
 }
 
 // ServerOptions configures IPC Server resource limits and timer injection.
@@ -446,6 +457,10 @@ func (s *Server) serveConn(cs *connState) {
 			cs.handleCancel(req)
 		case *StatusReq:
 			cs.handleStatus(frame.ReqID)
+		case *RecordOpenReq:
+			cs.handleRecordOpen(frame.ReqID, req)
+		case *ApplyFilterRuleReq:
+			cs.handleApplyFilterRule(frame.ReqID, req)
 		default:
 			cs.writeError(frame.ReqID, ErrBadRequest, "unexpected message type")
 		}
@@ -647,4 +662,74 @@ func (cs *connState) handleStatus(reqID uint32) {
 		ActiveSessions:  uint32(active),
 		RejectedConns:   cs.server.totalRejected(),
 	})
+}
+
+func (cs *connState) handleRecordOpen(reqID uint32, req *RecordOpenReq) {
+	if strings.TrimSpace(req.Path) == "" {
+		cs.writeError(reqID, ErrBadRequest, "record open requires a non-empty path")
+		return
+	}
+	select {
+	case cs.reqSem <- struct{}{}:
+	case <-cs.connCtx.Done():
+		return
+	}
+	cs.wg.Add(1)
+	go func() {
+		defer func() {
+			<-cs.reqSem
+			cs.wg.Done()
+		}()
+		if rec, ok := cs.server.backend.(FrecencyRecorder); ok {
+			if err := rec.RecordOpen(cs.connCtx, req.Path); err != nil {
+				var rpcErr *RPCError
+				if errors.As(err, &rpcErr) {
+					cs.writeError(reqID, rpcErr.Code, rpcErr.Message)
+					return
+				}
+				cs.writeError(reqID, ErrInternal, err.Error())
+				return
+			}
+		}
+		_ = cs.writeMessage(reqID, &RecordOpenAck{})
+	}()
+}
+
+func (cs *connState) handleApplyFilterRule(reqID uint32, req *ApplyFilterRuleReq) {
+	if strings.TrimSpace(req.TargetPath) == "" {
+		cs.writeError(reqID, ErrBadRequest, "apply filter rule requires a non-empty target path")
+		return
+	}
+	if req.Action != FilterActionFold && req.Action != FilterActionHardExclude {
+		cs.writeError(reqID, ErrBadRequest, fmt.Sprintf("unsupported filter rule action %d", req.Action))
+		return
+	}
+	applier, ok := cs.server.backend.(FilterRuleApplier)
+	if !ok {
+		cs.writeError(reqID, ErrInternal, "filter rule governance is not enabled on this daemon")
+		return
+	}
+	select {
+	case cs.reqSem <- struct{}{}:
+	case <-cs.connCtx.Done():
+		return
+	}
+	cs.wg.Add(1)
+	go func() {
+		defer func() {
+			<-cs.reqSem
+			cs.wg.Done()
+		}()
+		affected, err := applier.ApplyFilterRule(cs.connCtx, *req)
+		if err != nil {
+			var rpcErr *RPCError
+			if errors.As(err, &rpcErr) {
+				cs.writeError(reqID, rpcErr.Code, rpcErr.Message)
+				return
+			}
+			cs.writeError(reqID, ErrInternal, err.Error())
+			return
+		}
+		_ = cs.writeMessage(reqID, &ApplyFilterRuleAck{AffectedCount: affected})
+	}()
 }

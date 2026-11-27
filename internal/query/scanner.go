@@ -294,7 +294,7 @@ func evalAtom(ca *compiledAtom, ec *evalContext) (bool, MatchTier) {
 		return false, TierNone
 
 	case AtomName:
-		tier, _, _ := MatchName(ec.name, ec.nonASCII, ca.needleBytes, ca.atom.Value)
+		tier := MatchNameWithFallback(ec.name, ec.nonASCII, ca.needleBytes, ca.atom.Value)
 		if tier == TierNone {
 			return false, TierNone
 		}

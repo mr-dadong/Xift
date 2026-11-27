@@ -5,7 +5,9 @@ import (
 	"sync/atomic"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
+	"github.com/mr-dadong/Xift/internal/ui/platform"
 )
 
 // GPUContextStats records window-specific MyGo rendering context creations and destructions.
@@ -184,4 +186,69 @@ func (h *MyGoWindowHost) GPUStats() GPUContextStats {
 		Destroyed: h.destroyed.Load(),
 		Live:      h.live.Load(),
 	}
+}
+
+// PopupContextMenu displays a native OS popup menu anchored to the active window.
+func (h *MyGoWindowHost) PopupContextMenu(items []ContextMenuItem) {
+	if len(items) == 0 {
+		return
+	}
+	mygo.RunOnMain(func() {
+		h.mu.Lock()
+		w := h.win
+		h.mu.Unlock()
+		if w == nil || w.IsDestroyed() {
+			return
+		}
+		menuItems := make([]*mygo.MenuItem, 0, len(items))
+		for _, it := range items {
+			if it.Separator {
+				menuItems = append(menuItems, mygo.Separator())
+				continue
+			}
+			cb := it.OnClick
+			menuItems = append(menuItems, &mygo.MenuItem{
+				ID:       it.ID,
+				Label:    it.Label,
+				Disabled: it.Disabled,
+				Click: func(_ *mygo.MenuItem, _ *mygo.Window) {
+					if cb != nil {
+						go cb()
+					}
+				},
+			})
+		}
+		m := mygo.NewMenu(menuItems)
+		m.Popup(w)
+	})
+}
+
+// StartFileDrag initiates a cross-platform native external file drag session for absPath.
+func (h *MyGoWindowHost) StartFileDrag(absPath string) error {
+	cleanPath, err := platform.ValidateAbsolutePath(absPath)
+	if err != nil {
+		return err
+	}
+	data, err := transfer.FileData(cleanPath)
+	if err != nil {
+		return err
+	}
+	var dragErr error
+	mygo.RunOnMain(func() {
+		h.mu.Lock()
+		w := h.win
+		h.mu.Unlock()
+		if w == nil || w.IsDestroyed() {
+			return
+		}
+		dragErr = w.StartDataDrag(data, mygo.DragOptions{})
+	})
+	return dragErr
+}
+
+// WriteClipboardText writes plain text to the system clipboard on the UI main thread.
+func (h *MyGoWindowHost) WriteClipboardText(text string) {
+	mygo.RunOnMain(func() {
+		mygo.Clipboard.WriteText(text)
+	})
 }
