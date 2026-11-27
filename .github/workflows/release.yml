@@ -80,7 +80,10 @@ jobs:
       - name: Upload bare binary artifact (for nfpm)
         uses: actions/upload-artifact@v5
         with:
-          name: bin-linux-${{ matrix.goarch }}-artifact
+          # Deliberately no "-artifact" suffix: publish downloads pattern
+          # '*-artifact' with merge-multiple, and two legs both named xift
+          # would collide in the flattened download directory.
+          name: bin-linux-${{ matrix.goarch }}
           if: matrix.goos == 'linux'
           path: dist/xift
           if-no-files-found: error
@@ -105,7 +108,7 @@ jobs:
       - name: Download linux binary artifact
         uses: actions/download-artifact@v6
         with:
-          name: bin-linux-${{ matrix.goarch }}-artifact
+          name: bin-linux-${{ matrix.goarch }}
           path: pkg
       - name: Build deb and rpm
         run: |
@@ -158,7 +161,6 @@ jobs:
               sha256sum -c "${f}.sha256"
             done
           done
-          rm -f xift xift.exe   # 裸二进制不入 Release
       - name: Generate checksums.txt
         run: |
           cd dist
