@@ -70,24 +70,29 @@ func windowOptionsForMode(mode WindowMode, view func(c *ui.Context)) mygo.Window
 func (h *MyGoWindowHost) Show(mode WindowMode, recreated bool, view func(c *ui.Context), onUserClose func()) {
 	mygo.RunOnMain(func() {
 		h.mu.Lock()
-		defer h.mu.Unlock()
+		existing := h.win
+		existingMode := h.curMode
+		h.mu.Unlock()
 
 		// Reuse existing window when mode matches and it is still alive.
-		if !recreated && h.win != nil && !h.win.IsDestroyed() && h.curMode == mode {
-			h.win.Show()
-			h.win.Focus()
-			h.win.Invalidate()
+		if !recreated && existing != nil && !existing.IsDestroyed() && existingMode == mode {
+			existing.Show()
+			existing.Focus()
+			existing.Invalidate()
 			return
 		}
 
 		// Destroy any previous window (e.g. switching between Launcher and Explorer)
-		// so only one GPU rendering context is alive at a time.
-		if h.win != nil {
-			old := h.win
-			h.win = nil
-			h.curMode = ModeNone
-			if !old.IsDestroyed() {
-				old.Destroy()
+		// outside h.mu so native callbacks cannot self-deadlock.
+		if existing != nil {
+			h.mu.Lock()
+			if h.win == existing {
+				h.win = nil
+				h.curMode = ModeNone
+			}
+			h.mu.Unlock()
+			if !existing.IsDestroyed() {
+				existing.Destroy()
 				h.destroyed.Add(1)
 				if h.live.Load() > 0 {
 					h.live.Add(^uint64(0))
@@ -102,8 +107,11 @@ func (h *MyGoWindowHost) Show(mode WindowMode, recreated bool, view func(c *ui.C
 				onUserClose()
 			}
 		})
+		h.mu.Lock()
 		h.win = w
 		h.curMode = mode
+		h.mu.Unlock()
+
 		h.created.Add(1)
 		h.live.Add(1)
 		w.Show()
@@ -142,28 +150,31 @@ func (h *MyGoWindowHost) Destroy() {
 	})
 }
 
-// Invalidate schedules a redraw on the active window if one is live.
+// Invalidate schedules a redraw on the active window on the MyGo main thread.
 func (h *MyGoWindowHost) Invalidate() {
-	h.mu.Lock()
-	w := h.win
-	h.mu.Unlock()
-	if w != nil && !w.IsDestroyed() {
-		w.Invalidate()
-	}
+	mygo.RunOnMain(func() {
+		h.mu.Lock()
+		w := h.win
+		h.mu.Unlock()
+		if w != nil && !w.IsDestroyed() {
+			w.Invalidate()
+		}
+	})
 }
 
 // Update runs fn on the UI thread and invalidates the active window.
 func (h *MyGoWindowHost) Update(fn func()) {
-	h.mu.Lock()
-	w := h.win
-	h.mu.Unlock()
-	if w != nil && !w.IsDestroyed() {
-		w.Update(fn)
-		return
-	}
-	if fn != nil {
-		mygo.RunOnMain(fn)
-	}
+	mygo.RunOnMain(func() {
+		if fn != nil {
+			fn()
+		}
+		h.mu.Lock()
+		w := h.win
+		h.mu.Unlock()
+		if w != nil && !w.IsDestroyed() {
+			w.Invalidate()
+		}
+	})
 }
 
 // GPUStats returns the cumulative window-specific GPU context counters.

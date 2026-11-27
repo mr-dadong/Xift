@@ -181,7 +181,7 @@ func (s *SearchController) SetQuery(text string, sort uint8, desc bool) {
 	s.mu.Unlock()
 
 	s.notify()
-	go s.runQuery(ctx, gen, pseq, text, sort, desc)
+	go s.runQuery(ctx, cancel, gen, pseq, text, sort, desc)
 }
 
 // Reconnect re-establishes the IPC connection if needed and re-runs the retained query text.
@@ -305,7 +305,7 @@ func (s *SearchController) RequestPage(offset uint32, limit uint16) {
 	s.pageCancel = cancel
 	s.mu.Unlock()
 
-	go s.runFetchPage(ctx, client, gen, pseq, sid, offset, reqLimit)
+	go s.runFetchPage(ctx, cancel, client, gen, pseq, sid, offset, reqLimit)
 }
 
 func (s *SearchController) ensureClient(ctx context.Context) (SearchClient, error) {
@@ -359,16 +359,21 @@ func (s *SearchController) dropClient(c SearchClient) {
 	}
 }
 
-func (s *SearchController) runQuery(ctx context.Context, gen, pseq uint64, text string, sort uint8, desc bool) {
+func (s *SearchController) runQuery(ctx context.Context, cancel context.CancelFunc, gen, pseq uint64, text string, sort uint8, desc bool) {
+	defer cancel()
+
 	client, err := s.ensureClient(ctx)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
 		s.commitError(gen, pseq, err, true)
 		return
 	}
 
 	meta, err := client.QueryStart(ctx, text, sort, desc, s.pathSep)
 	if err != nil {
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
 			return
 		}
 		isRPC := false
@@ -410,13 +415,17 @@ func (s *SearchController) runQuery(ctx context.Context, gen, pseq uint64, text 
 	}
 	s.mu.Unlock()
 
-	s.runFetchPage(ctx, client, gen, pseq, meta.SessionID, 0, fetchLimit)
+	s.runFetchPage(ctx, nil, client, gen, pseq, meta.SessionID, 0, fetchLimit)
 }
 
-func (s *SearchController) runFetchPage(ctx context.Context, client SearchClient, gen, pseq, sid uint64, offset uint32, limit uint16) {
+func (s *SearchController) runFetchPage(ctx context.Context, cancel context.CancelFunc, client SearchClient, gen, pseq, sid uint64, offset uint32, limit uint16) {
+	if cancel != nil {
+		defer cancel()
+	}
+
 	vp, err := client.FetchViewport(ctx, sid, offset, limit)
 	if err != nil {
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
 			return
 		}
 		isRPC := false

@@ -193,10 +193,14 @@ func (a *App) QueryInput() string {
 
 // SetQueryInput updates the shared query text and starts a background IPC search if changed.
 func (a *App) SetQueryInput(text string) {
+	a.setQueryInternal(text, true)
+}
+
+func (a *App) setQueryInternal(text string, fromExternal bool) {
 	a.mu.Lock()
 	changed := text != a.lastSubmitted
 	a.queryInput = text
-	if text != a.uiQueryBuf {
+	if fromExternal {
 		a.uiQueryDirtyFromExt = true
 	}
 	if changed {
@@ -209,7 +213,13 @@ func (a *App) SetQueryInput(text string) {
 	a.mu.Unlock()
 
 	if changed {
-		a.listState.ScrollTo(0, ui.Start)
+		if !fromExternal {
+			a.listState.ScrollTo(0, ui.Start)
+		} else if a.host != nil {
+			a.host.Update(func() {
+				a.listState.ScrollTo(0, ui.Start)
+			})
+		}
 		a.search.SetQuery(text, sortOrder, sortDesc)
 		if a.onQueryChanged != nil {
 			a.onQueryChanged(text)
@@ -231,7 +241,7 @@ func (a *App) syncUIQueryBeforeRender() {
 // syncUIQueryAfterRender submits the query if ui.TextInput mutated a.uiQueryBuf.
 func (a *App) syncUIQueryAfterRender() {
 	if a.uiQueryBuf != a.QueryInput() {
-		a.SetQueryInput(a.uiQueryBuf)
+		a.setQueryInternal(a.uiQueryBuf, false)
 	}
 }
 
@@ -422,9 +432,19 @@ func (a *App) EnsureViewportLoaded(snap SearchSnapshot, firstVis, lastVis int) {
 		return
 	}
 
-	pageSize := uint32(DefaultPageSize)
-	pageStart := (uint32(firstVis) / pageSize) * pageSize
-	a.search.RequestPage(pageStart, DefaultPageSize)
+	// Request an unaligned single page starting at firstVis so a viewport straddling
+	// a DefaultPageSize boundary is covered in one <= MaxPageSize fetch instead of
+	// re-requesting the already-loaded lower aligned page.
+	needed := lastIdx - firstVis + 1
+	reqLimit := DefaultPageSize
+	if needed > int(reqLimit) {
+		if needed > int(MaxPageSize) {
+			reqLimit = MaxPageSize
+		} else {
+			reqLimit = uint16(needed)
+		}
+	}
+	a.search.RequestPage(uint32(firstVis), reqLimit)
 }
 
 func (a *App) renderView(c *ui.Context) {
