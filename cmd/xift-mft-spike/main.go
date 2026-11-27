@@ -241,17 +241,17 @@ func emitSyntheticMFT(total int, emit func(mftspike.RawRecord)) {
 		return
 	}
 	const (
-		rootFRN        uint64 = 5
-		workDirFRN     uint64 = 10
-		nodeModFRN     uint64 = 11
-		gitDirFRN      uint64 = 12
-		gpuCacheFRN    uint64 = 13
-		targetDirFRN   uint64 = 14
-		winDirFRN      uint64 = 15
-		sys32DirFRN    uint64 = 16
-		docsDirFRN     uint64 = 17
-		subPkgBaseFRN  uint64 = 100
-		subPkgCount           = 400
+		rootFRN       uint64 = 5
+		workDirFRN    uint64 = 10
+		nodeModFRN    uint64 = 11
+		gitDirFRN     uint64 = 12
+		gpuCacheFRN   uint64 = 13
+		targetDirFRN  uint64 = 14
+		winDirFRN     uint64 = 15
+		sys32DirFRN   uint64 = 16
+		docsDirFRN    uint64 = 17
+		subPkgBaseFRN uint64 = 100
+		subPkgCount          = 400
 	)
 
 	emitted := 0

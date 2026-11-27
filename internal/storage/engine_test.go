@@ -529,4 +529,3 @@ func TestEngineMVCCSnapshotIsolationAndCrashFencing(t *testing.T) {
 		t.Fatalf("closed ResolvePath = %v, want ErrClosed", err)
 	}
 }
-

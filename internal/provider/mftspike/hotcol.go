@@ -49,10 +49,10 @@ type HotColumnWriter struct {
 	hotBuf    *bufio.Writer
 	namesBuf  *bufio.Writer
 
-	nameOffset uint64
-	nodeCount  int
-	extPool    map[string]uint16
-	nextExtID  uint16
+	nameOffset  uint64
+	nodeCount   int
+	extPool     map[string]uint16
+	nextExtID   uint16
 	nodeScratch [HotNodeSize]byte
 }
 

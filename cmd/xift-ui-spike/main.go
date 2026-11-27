@@ -131,9 +131,9 @@ func main() {
 
 	mygo.App.WhenReady(func() {
 		mygo.NewWindow(mygo.WindowOptions{
-			Title:  "Xift P0-01 Spike — MyGo ui.List 300万虚拟列表 & 中文 IME 压测",
-			Width:  1120,
-			Height: 720,
+			Title:   "Xift P0-01 Spike — MyGo ui.List 300万虚拟列表 & 中文 IME 压测",
+			Width:   1120,
+			Height:  720,
 			Content: ui.View(app.view),
 		})
 	})

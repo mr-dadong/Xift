@@ -315,4 +315,3 @@ func BenchmarkColdStart1M(b *testing.B) {
 		_ = e.Close()
 	}
 }
-
