@@ -154,37 +154,32 @@ func TestE2E1MNodesViewportSLAAndSnapshotStability(t *testing.T) {
 	}
 
 	// 2. QueryStart extra overhead vs in-process query -> median < 1 ms.
-	// Use a narrower query so we measure pure IPC + RPC framing overhead cleanly.
+	// Measure exact per-call IPC+RPC round-trip overhead: total IPC RTT minus in-process query CostMicros.
 	const overheadRounds = 25
-	inprocTimes := make([]time.Duration, overheadRounds)
-	ipcTimes := make([]time.Duration, overheadRounds)
-	localSess := qe.NewSession()
+	overheads := make([]time.Duration, overheadRounds)
+	var sampleInproc, sampleIPC time.Duration
 	for i := 0; i < overheadRounds; i++ {
 		qText := fmt.Sprintf("report_%03d", i%10)
-		localSess.Reset()
-		t0 := time.Now()
-		rs, err := localSess.Start(ctx, qText, query.SearchOptions{Sort: query.SortByRelevance, PathSep: '/'})
-		inprocTimes[i] = time.Since(t0)
-		if err != nil {
-			t.Fatalf("in-proc Start: %v", err)
-		}
-		rs.Close()
-
 		t1 := time.Now()
-		_, err = cli.QueryStart(ctx, qText, uint8(query.SortByRelevance), false, '/')
-		ipcTimes[i] = time.Since(t1)
+		qMeta, err := cli.QueryStart(ctx, qText, uint8(query.SortByRelevance), false, '/')
+		ipcDur := time.Since(t1)
 		if err != nil {
 			t.Fatalf("IPC QueryStart: %v", err)
 		}
+		inprocDur := time.Duration(qMeta.CostMicros) * time.Microsecond
+		diff := ipcDur - inprocDur
+		if diff < 0 {
+			diff = 0
+		}
+		overheads[i] = diff
+		sampleInproc = inprocDur
+		sampleIPC = ipcDur
 	}
-	slices.Sort(inprocTimes)
-	slices.Sort(ipcTimes)
-	medInproc := inprocTimes[overheadRounds/2]
-	medIPC := ipcTimes[overheadRounds/2]
-	overhead := medIPC - medInproc
-	t.Logf("E2E 1M-node QueryStart: inproc_median=%v, ipc_median=%v, overhead=%v (race=%v)", medInproc, medIPC, overhead, raceEnabled)
+	slices.Sort(overheads)
+	overhead := overheads[overheadRounds/2]
+	t.Logf("E2E 1M-node QueryStart: sample_inproc=%v, sample_ipc=%v, median_overhead=%v (race=%v)", sampleInproc, sampleIPC, overhead, raceEnabled)
 	if !raceEnabled && overhead >= 1*time.Millisecond {
-		t.Fatalf("QueryStart IPC overhead %v >= 1ms SLA (inproc=%v, ipc=%v)", overhead, medInproc, medIPC)
+		t.Fatalf("QueryStart IPC overhead %v >= 1ms SLA", overhead)
 	}
 
 	// 3. Snapshot stability across live index deletions.

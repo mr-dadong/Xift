@@ -381,6 +381,8 @@ func splitPathParts(p string) []string {
 	var parts []string
 	if vol != "" {
 		parts = append(parts, vol)
+	} else if len(rest) > 0 && rest[0] == '/' {
+		parts = append(parts, "/")
 	}
 	cur := rest
 	for len(cur) > 0 {

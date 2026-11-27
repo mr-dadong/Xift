@@ -93,11 +93,13 @@ func TestWindowsPipeProtectedDACLOnlyOwner(t *testing.T) {
 	}
 
 	// Verify SDDL string contains protected DACL with only the owner SID allow ACE.
+	// Note: Windows SDDL abbreviates the built-in Local Administrator SID (*-500) as "LA".
 	sddl := sd.String()
 	if !strings.Contains(sddl, "D:P(") {
 		t.Fatalf("SDDL missing protected DACL D:P(...): %s", sddl)
 	}
-	if !strings.Contains(sddl, selfSIDStr) {
+	isLocalAdmin := strings.HasSuffix(selfSIDStr, "-500")
+	if !strings.Contains(sddl, selfSIDStr) && !(isLocalAdmin && strings.Contains(sddl, ";;;LA)")) {
 		t.Fatalf("SDDL missing owner SID %s: %s", selfSIDStr, sddl)
 	}
 	// Ensure no Everyone (WD), Authenticated Users (AU), or Users (BU) ACEs exist.
