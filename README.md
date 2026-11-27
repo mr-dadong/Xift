@@ -18,14 +18,13 @@
 
 <br/>
 
-```text
- ██╗  ██╗██╗███████╗████████╗
- ╚██╗██╔╝██║██╔════╝╚══██╔══╝     Cross-platform + Sift
-  ╚███╔╝ ██║█████╗     ██║        ─────────────────────
-  ██╔██╗ ██║██╔══╝     ██║        3.62 ms  · 1M-node hot query
- ██╔╝ ██╗██║██║        ██║        10.24 ns · 0 B · 0 allocs / match
- ╚═╝  ╚═╝╚═╝╚═╝        ╚═╝        0 lines of C
-```
+<table>
+<tr>
+<td align="center" width="200"><h3>⚡ 3.62 ms</h3><sub>hot query over 1M nodes</sub></td>
+<td align="center" width="200"><h3>🧠 0 allocs</h3><sub>10.24 ns per name match</sub></td>
+<td align="center" width="200"><h3>🦫 0 lines of C</h3><sub>Pure Go, <code>CGO_ENABLED=0</code></sub></td>
+</tr>
+</table>
 
 </div>
 

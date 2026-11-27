@@ -4,7 +4,7 @@
 
 # Xift
 
-### ⚡ 亿级文件，毫秒淘沙：三端统一、Pure Go、零 CGO
+### ⚡ 亿级文件，毫秒直达：三端统一、Pure Go、零 CGO
 
 [English](README.md) · **简体中文**
 
@@ -18,14 +18,13 @@
 
 <br/>
 
-```text
- ██╗  ██╗██╗███████╗████████╗
- ╚██╗██╔╝██║██╔════╝╚══██╔══╝     Cross-platform + Sift
-  ╚███╔╝ ██║█████╗     ██║        ─────────────────────
-  ██╔██╗ ██║██╔══╝     ██║        3.62 ms  · 百万节点热查询
- ██╔╝ ██╗██║██║        ██║        10.24 ns · 0 B · 0 次分配 / 匹配
- ╚═╝  ╚═╝╚═╝╚═╝        ╚═╝        0 行 C 代码
-```
+<table>
+<tr>
+<td align="center" width="200"><h3>⚡ 3.62 ms</h3><sub>百万节点热查询</sub></td>
+<td align="center" width="200"><h3>🧠 0 次分配</h3><sub>单次文件名匹配 10.24 ns</sub></td>
+<td align="center" width="200"><h3>🦫 0 行 C 代码</h3><sub>Pure Go，<code>CGO_ENABLED=0</code></sub></td>
+</tr>
+</table>
 
 </div>
 
