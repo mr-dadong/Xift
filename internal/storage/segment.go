@@ -979,3 +979,16 @@ func (s *Segment) ForEachLiveWithDel(delBits []uint64, fn func(nodeID uint32, no
 		}
 	}
 }
+
+// ForEachKey iterates all live (volID, nodeKey, nodeID) entries from keys.idx.
+func (s *Segment) ForEachKey(fn func(volID uint16, nodeKey uint64, nodeID uint32) bool) {
+	for i := range s.keys {
+		e := s.keys[i]
+		if e.LocalIdx >= s.meta.NodeCount || s.IsDeleted(e.LocalIdx) {
+			continue
+		}
+		if !fn(e.VolID, e.NodeKey, s.NodeIDAt(e.LocalIdx)) {
+			return
+		}
+	}
+}

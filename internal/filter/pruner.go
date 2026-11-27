@@ -406,8 +406,10 @@ func (p *Pruner) InterceptEvent(ev EventInput, ignoreStack *IgnoreStack) EventDe
 			}
 			return EventDecision{Action: DecisionPass, Flags: FlagDir}
 		}
-		if p.classifyFile(ev.Name, ev.RelPath, ignoreStack) == ActionHardExclude {
-			return EventDecision{Action: DecisionDrop}
+		if ev.Name != "" || ev.RelPath != "" {
+			if p.classifyFile(ev.Name, ev.RelPath, ignoreStack) == ActionHardExclude {
+				return EventDecision{Action: DecisionDrop}
+			}
 		}
 		return EventDecision{Action: DecisionPass}
 	}
@@ -427,6 +429,24 @@ func (p *Pruner) InterceptEvent(ev EventInput, ignoreStack *IgnoreStack) EventDe
 			}
 			if oldFlags.IsSystem() || effectiveSys {
 				flags |= FlagSystem
+			}
+			return EventDecision{Action: DecisionPass, Flags: flags}
+		}
+
+		if ev.Op == EventRename && ev.Name == "" && ev.RelPath == "" {
+			// Nameless directory move (e.g. OpMoveDir): preserve existing governance flags without un-folding.
+			if oldFlags&(DirFlagHardExcluded|DirFlagPrunedDescendant) != 0 {
+				return EventDecision{Action: DecisionDrop}
+			}
+			flags := FlagDir
+			if oldFlags&DirFlagFoldedShell != 0 {
+				flags |= FlagFolded
+			}
+			if oldFlags.IsSystem() || effectiveSys {
+				flags |= FlagSystem
+				if ev.NodeKey != 0 && !oldFlags.IsSystem() {
+					p.set.AddFlags(ev.VolID, ev.NodeKey, DirFlagSystem)
+				}
 			}
 			return EventDecision{Action: DecisionPass, Flags: flags}
 		}
@@ -484,6 +504,13 @@ func (p *Pruner) InterceptEvent(ev EventInput, ignoreStack *IgnoreStack) EventDe
 	}
 
 	// Regular file (Create / Rename / ModifyMeta) under visible parent
+	if ev.Op == EventModifyMeta && ev.Name == "" && ev.RelPath == "" {
+		var flags uint16
+		if effectiveSys {
+			flags = FlagSystem
+		}
+		return EventDecision{Action: DecisionPass, Flags: flags}
+	}
 	act := p.classifyFile(ev.Name, ev.RelPath, ignoreStack)
 	if act == ActionHardExclude {
 		if ev.Op == EventRename {
