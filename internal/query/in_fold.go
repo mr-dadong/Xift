@@ -12,29 +12,26 @@ import (
 	"github.com/mr-dadong/Xift/internal/storage"
 )
 
-// executeFoldedSearch implements on-demand read-only local directory scanning for `in:<dir>`
+// startFoldedSearch implements on-demand read-only local directory scanning for `in:<dir>`
 // queries (V2.1 Section 4.1 & 7.1). Results are never written to storage.Engine, MemTable, or WAL.
-func (e *Engine) executeFoldedSearch(
+func (e *Engine) startFoldedSearch(
 	ctx context.Context,
 	snap *storage.Snapshot,
 	q *Query,
 	plan *compiledPlan,
 	opts SearchOptions,
 	start time.Time,
-) (*SearchResult, error) {
+) (*ResultSet, error) {
 	targetDirs := findInTargetDirs(snap, q.InDirs)
 	if len(targetDirs) == 0 {
-		cost := time.Since(start)
-		return &SearchResult{
-			Query:    q.Raw,
-			Total:    0,
-			Returned: 0,
-			Offset:   opts.Offset,
-			Limit:    opts.Limit,
-			Cost:     cost,
-			CostMs:   float64(cost.Microseconds()) / 1000.0,
-			Warnings: q.Warnings,
-			Items:    []ResultItem{},
+		return &ResultSet{
+			query:       q.Raw,
+			pathSep:     opts.PathSep,
+			total:       0,
+			foldedItems: []ResultItem{},
+			isFolded:    true,
+			cost:        time.Since(start),
+			warnings:    q.Warnings,
 		}, nil
 	}
 
@@ -138,28 +135,22 @@ func (e *Engine) executeFoldedSearch(
 
 	sortResultItems(matched, opts.Sort, opts.Desc)
 	total := len(matched)
-	var items []ResultItem
-	if opts.Offset < total {
-		end := opts.Offset + opts.Limit
-		if end > total {
-			end = total
-		}
-		items = matched[opts.Offset:end]
-	} else {
-		items = []ResultItem{}
+	maxRetained := opts.MaxRetained
+	if maxRetained <= 0 {
+		maxRetained = DefaultMaxRetained
+	}
+	if len(matched) > maxRetained {
+		matched = matched[:maxRetained]
 	}
 
-	cost := time.Since(start)
-	return &SearchResult{
-		Query:    q.Raw,
-		Total:    total,
-		Returned: len(items),
-		Offset:   opts.Offset,
-		Limit:    opts.Limit,
-		Cost:     cost,
-		CostMs:   float64(cost.Microseconds()) / 1000.0,
-		Warnings: q.Warnings,
-		Items:    items,
+	return &ResultSet{
+		query:       q.Raw,
+		pathSep:     opts.PathSep,
+		total:       total,
+		foldedItems: matched,
+		isFolded:    true,
+		cost:        time.Since(start),
+		warnings:    q.Warnings,
 	}, nil
 }
 

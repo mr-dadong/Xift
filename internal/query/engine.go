@@ -51,6 +51,7 @@ type SearchOptions struct {
 	Now              time.Time
 	FoldedMaxEntries int
 	FoldedMaxDepth   int
+	MaxRetained      int
 }
 
 func (o *SearchOptions) normalize() {
@@ -81,6 +82,9 @@ func (o *SearchOptions) normalize() {
 	}
 	if o.FoldedMaxDepth <= 0 {
 		o.FoldedMaxDepth = 32
+	}
+	if o.MaxRetained <= 0 {
+		o.MaxRetained = DefaultMaxRetained
 	}
 }
 
@@ -151,8 +155,9 @@ func (e *Engine) NewSession() *Session {
 	return &Session{engine: e}
 }
 
-// Search parses rawQuery and executes a single stateless search against the latest storage snapshot.
-func (e *Engine) Search(ctx context.Context, rawQuery string, opts SearchOptions) (*SearchResult, error) {
+// Start parses rawQuery, scans and ranks matching nodes, and returns a ResultSet holding
+// a point-in-time snapshot for on-demand Viewport materialization. Callers MUST call Close().
+func (e *Engine) Start(ctx context.Context, rawQuery string, opts SearchOptions) (*ResultSet, error) {
 	if e == nil || e.store == nil {
 		return nil, fmt.Errorf("query: nil storage engine")
 	}
@@ -165,17 +170,41 @@ func (e *Engine) Search(ctx context.Context, rawQuery string, opts SearchOptions
 	}
 
 	snap := e.store.AcquireSnapshot()
-	defer snap.Release()
-
 	plan := compileQuery(q, e.store.ExtPool())
 
 	if len(q.InDirs) > 0 {
-		return e.executeFoldedSearch(ctx, snap, q, plan, opts, start)
+		rs, err := e.startFoldedSearch(ctx, snap, q, plan, opts, start)
+		snap.Release()
+		return rs, err
 	}
 
 	cands, coldReads, err := scanSnapshot(ctx, snap, plan, opts.Workers)
 	if err != nil {
+		snap.Release()
 		return nil, err
 	}
-	return e.rankAndMaterialize(ctx, snap, q, plan, cands, coldReads, false, opts, start)
+	rs, err := e.rankCandidates(ctx, snap, q, plan, cands, coldReads, false, opts, start)
+	if err != nil {
+		snap.Release()
+		return nil, err
+	}
+	return rs, nil
+}
+
+// Search parses rawQuery and executes a single stateless search against the latest storage snapshot.
+func (e *Engine) Search(ctx context.Context, rawQuery string, opts SearchOptions) (*SearchResult, error) {
+	opts.normalize()
+	start := time.Now()
+
+	rs, err := e.Start(ctx, rawQuery, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+
+	items, err := rs.Viewport(ctx, opts.Offset, opts.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return rs.toSearchResult(items, opts.Offset, opts.Limit, start), nil
 }

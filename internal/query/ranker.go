@@ -2,7 +2,6 @@ package query
 
 import (
 	"context"
-	"slices"
 	"strings"
 	"time"
 
@@ -15,7 +14,7 @@ const (
 	exactDepthCutoff    = 4096
 )
 
-func (e *Engine) rankAndMaterialize(
+func (e *Engine) rankCandidates(
 	ctx context.Context,
 	snap *storage.Snapshot,
 	q *Query,
@@ -25,23 +24,21 @@ func (e *Engine) rankAndMaterialize(
 	incremental bool,
 	opts SearchOptions,
 	start time.Time,
-) (*SearchResult, error) {
+) (*ResultSet, error) {
 	total := len(cands)
 	if total == 0 {
-		cost := time.Since(start)
-		return &SearchResult{
-			Query:       q.Raw,
-			Total:       0,
-			Returned:    0,
-			Offset:      opts.Offset,
-			Limit:       opts.Limit,
-			Cost:        cost,
-			CostMs:      float64(cost.Microseconds()) / 1000.0,
-			Incremental: incremental,
-			ColdReads:   coldReads,
-			Warnings:    q.Warnings,
-			Items:       []ResultItem{},
-		}, nil
+		snap.Release()
+		rs := &ResultSet{
+			query:       q.Raw,
+			plan:        plan,
+			pathSep:     opts.PathSep,
+			total:       0,
+			cost:        time.Since(start),
+			incremental: incremental,
+			warnings:    q.Warnings,
+		}
+		rs.coldReads.Store(int64(coldReads))
+		return rs, nil
 	}
 
 	// Compute initial scores cheaply without cold reads or full path resolution.
@@ -65,9 +62,15 @@ func (e *Engine) rankAndMaterialize(
 		c.score = score
 	}
 
+	maxRetained := opts.MaxRetained
+	if maxRetained <= 0 {
+		maxRetained = DefaultMaxRetained
+	}
+
+	var kept []candidate
 	switch opts.Sort {
 	case SortByRelevance:
-		slices.SortFunc(cands, func(a, b candidate) int {
+		kept = selectTopK(cands, maxRetained, func(a, b candidate) int {
 			if a.score > b.score {
 				return -1
 			}
@@ -83,8 +86,7 @@ func (e *Engine) rankAndMaterialize(
 			return 0
 		})
 	case SortByName:
-		// Sort by lowercased basename using snapshot lookup.
-		slices.SortFunc(cands, func(a, b candidate) int {
+		kept = selectTopK(cands, maxRetained, func(a, b candidate) int {
 			_, na, _ := snap.LookupNode(a.nodeID)
 			_, nb, _ := snap.LookupNode(b.nodeID)
 			cmp := compareASCIIFold(na, nb)
@@ -105,6 +107,11 @@ func (e *Engine) rankAndMaterialize(
 	case SortBySize, SortByModTime:
 		// Cold-column sort requires loading cold metadata for matched candidates.
 		for i := range cands {
+			if (i & ctxCheckIntervalMask) == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
 			if !cands[i].hasCold {
 				coldReads++
 				if cm, err := snap.ReadColdMeta(cands[i].nodeID); err == nil {
@@ -114,7 +121,7 @@ func (e *Engine) rankAndMaterialize(
 				}
 			}
 		}
-		slices.SortFunc(cands, func(a, b candidate) int {
+		kept = selectTopK(cands, maxRetained, func(a, b candidate) int {
 			var av, bv int64
 			if opts.Sort == SortBySize {
 				av, bv = a.size, b.size
@@ -141,86 +148,38 @@ func (e *Engine) rankAndMaterialize(
 			}
 			return 0
 		})
+	default:
+		kept = cands
+		if len(kept) > maxRetained {
+			kept = kept[:maxRetained]
+		}
 	}
 
-	// Slice viewport [Offset : Offset+Limit] and materialize paths + cold columns ONLY for viewport rows.
-	if opts.Offset >= total {
-		cost := time.Since(start)
-		return &SearchResult{
-			Query:       q.Raw,
-			Total:       total,
-			Returned:    0,
-			Offset:      opts.Offset,
-			Limit:       opts.Limit,
-			Cost:        cost,
-			CostMs:      float64(cost.Microseconds()) / 1000.0,
-			Incremental: incremental,
-			ColdReads:   coldReads,
-			Warnings:    q.Warnings,
-			Items:       []ResultItem{},
-		}, nil
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	end := opts.Offset + opts.Limit
-	if end > total {
-		end = total
-	}
-	vp := cands[opts.Offset:end]
-	items := make([]ResultItem, 0, len(vp))
-
-	for i := range vp {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	rows := make([]rankedRow, len(kept))
+	for i := range kept {
+		rows[i] = rankedRow{
+			nodeID: kept[i].nodeID,
+			score:  float32(kept[i].score),
 		}
-		c := vp[i]
-		node, nameBytes, ok := snap.LookupNode(c.nodeID)
-		if !ok {
-			continue
-		}
-		pathStr, err := snap.ResolvePathWithSep(c.nodeID, opts.PathSep)
-		if err != nil {
-			pathStr = string(nameBytes)
-		}
-		size, mtime := c.size, c.modTime
-		if !c.hasCold {
-			coldReads++
-			if cm, err := snap.ReadColdMeta(c.nodeID); err == nil {
-				size = cm.Size
-				mtime = cm.ModTime
-			}
-		}
-		highlights := computeHighlights(nameBytes, (node.Flags&storage.FlagNonASCII) != 0, plan.positiveNames)
-		items = append(items, ResultItem{
-			NodeID:     c.nodeID,
-			Path:       pathStr,
-			Name:       string(nameBytes),
-			Flags:      node.Flags,
-			ExtID:      node.ExtID,
-			VolID:      node.VolID,
-			IsDir:      (node.Flags & storage.FlagDir) != 0,
-			Folded:     (node.Flags & storage.FlagFolded) != 0,
-			System:     (node.Flags & storage.FlagSystem) != 0,
-			Size:       size,
-			ModTime:    mtime,
-			Score:      c.score,
-			Highlights: highlights,
-		})
 	}
 
-	cost := time.Since(start)
-	return &SearchResult{
-		Query:       q.Raw,
-		Total:       total,
-		Returned:    len(items),
-		Offset:      opts.Offset,
-		Limit:       opts.Limit,
-		Cost:        cost,
-		CostMs:      float64(cost.Microseconds()) / 1000.0,
-		Incremental: incremental,
-		ColdReads:   coldReads,
-		Warnings:    q.Warnings,
-		Items:       items,
-	}, nil
+	rs := &ResultSet{
+		snap:        snap,
+		query:       q.Raw,
+		plan:        plan,
+		pathSep:     opts.PathSep,
+		total:       total,
+		rows:        rows,
+		cost:        time.Since(start),
+		incremental: incremental,
+		warnings:    q.Warnings,
+	}
+	rs.coldReads.Store(int64(coldReads))
+	return rs, nil
 }
 
 func computeHighlights(name []byte, nonASCII bool, posNames []compiledAtom) []HighlightRange {
