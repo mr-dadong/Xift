@@ -46,10 +46,10 @@ func (s *Session) Reset() {
 	s.mu.Unlock()
 }
 
-// Search executes rawQuery on this Session, cancelling any previous in-flight query
-// and reusing cached candidates when the new query strictly narrows the prior query
-// against the same storage Snapshot generation.
-func (s *Session) Search(ctx context.Context, rawQuery string, opts SearchOptions) (*SearchResult, error) {
+// Start executes rawQuery on this Session, cancelling any previous in-flight query and
+// reusing cached candidates when the new query strictly narrows the prior query against the
+// same storage Snapshot generation. The returned ResultSet holds the snapshot until Close().
+func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions) (*ResultSet, error) {
 	if s == nil || s.engine == nil || s.engine.store == nil {
 		return nil, fmt.Errorf("query: nil session engine")
 	}
@@ -65,6 +65,10 @@ func (s *Session) Search(ctx context.Context, rawQuery string, opts SearchOption
 	defer cancel()
 
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return nil, err
+	}
 	if s.activeCancel != nil {
 		s.activeCancel()
 	}
@@ -86,12 +90,12 @@ func (s *Session) Search(ctx context.Context, rawQuery string, opts SearchOption
 	}()
 
 	snap := s.engine.store.AcquireSnapshot()
-	defer snap.Release()
-
 	plan := compileQuery(q, s.engine.store.ExtPool())
 
 	if len(q.InDirs) > 0 {
-		return s.engine.executeFoldedSearch(runCtx, snap, q, plan, opts, start)
+		rs, err := s.engine.startFoldedSearch(runCtx, snap, q, plan, opts, start)
+		snap.Release()
+		return rs, err
 	}
 
 	var cands []candidate
@@ -101,12 +105,14 @@ func (s *Session) Search(ctx context.Context, rawQuery string, opts SearchOption
 	if hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q) {
 		cands, coldReads, err = refineCandidates(runCtx, snap, cachedCands, plan)
 		if err != nil {
+			snap.Release()
 			return nil, err
 		}
 		incremental = true
 	} else {
 		cands, coldReads, err = scanSnapshot(runCtx, snap, plan, opts.Workers)
 		if err != nil {
+			snap.Release()
 			return nil, err
 		}
 	}
@@ -132,7 +138,32 @@ func (s *Session) Search(ctx context.Context, rawQuery string, opts SearchOption
 		s.mu.Unlock()
 	}
 
-	return s.engine.rankAndMaterialize(runCtx, snap, q, plan, cands, coldReads, incremental, opts, start)
+	rs, err := s.engine.rankCandidates(runCtx, snap, q, plan, cands, coldReads, incremental, opts, start)
+	if err != nil {
+		snap.Release()
+		return nil, err
+	}
+	return rs, nil
+}
+
+// Search executes rawQuery on this Session, cancelling any previous in-flight query
+// and reusing cached candidates when the new query strictly narrows the prior query
+// against the same storage Snapshot generation.
+func (s *Session) Search(ctx context.Context, rawQuery string, opts SearchOptions) (*SearchResult, error) {
+	opts.normalize()
+	start := time.Now()
+
+	rs, err := s.Start(ctx, rawQuery, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+
+	items, err := rs.Viewport(ctx, opts.Offset, opts.Limit)
+	if err != nil {
+		return nil, err
+	}
+	return rs.toSearchResult(items, opts.Offset, opts.Limit, start), nil
 }
 
 func refineCandidates(
