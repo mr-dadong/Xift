@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release-ready:
@@ -22,7 +22,10 @@ jobs:
       - name: Validate tag and derive version
         id: ver
         run: |
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+          # Only a tag *push* is a release. A manual workflow_dispatch can also
+          # target a tag ref, so checking GITHUB_REF_TYPE alone would let a
+          # debug run publish (or --clobber) a real Release.
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
             tag="${GITHUB_REF_NAME}"
             if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$'; then
               echo "::error::tag '$tag' does not match ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$"
@@ -46,6 +49,8 @@ jobs:
       VERSION: ${{ needs.release-ready.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -100,6 +105,8 @@ jobs:
       VERSION: ${{ needs.release-ready.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -130,9 +137,13 @@ jobs:
 
   publish:
     needs: [release-ready, build, packages]
-    if: startsWith(github.ref, 'refs/tags/')
+    # A manual workflow_dispatch may also target a tag ref; requiring the push
+    # event keeps debug runs from creating or clobbering a real Release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.release-ready.outputs.version }}
       GH_TOKEN: ${{ github.token }}
