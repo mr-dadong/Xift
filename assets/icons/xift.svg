@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" fill="none">
+  <defs>
+    <linearGradient id="xift-bg" x1="80" y1="80" x2="944" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1F6FE8"/>
+      <stop offset="50%" stop-color="#2B53D8"/>
+      <stop offset="100%" stop-color="#3628AD"/>
+    </linearGradient>
+    <clipPath id="xift-arms-clip">
+      <rect x="40" y="199" width="944" height="626"/>
+    </clipPath>
+    <!-- Concentric circular gap mask (r=281) detaching top-right and bottom-left arms from the ring -->
+    <mask id="xift-gap-mask">
+      <rect x="0" y="0" width="1024" height="1024" fill="#FFFFFF"/>
+      <circle cx="512" cy="512" r="281" fill="#000000"/>
+    </mask>
+  </defs>
+
+  <!-- Squircle background -->
+  <rect x="40" y="40" width="944" height="944" rx="206" fill="url(#xift-bg)"/>
+
+  <!-- Detached top-right & bottom-left X arms (clean concentric arc gap from ring) -->
+  <g clip-path="url(#xift-arms-clip)" mask="url(#xift-gap-mask)" fill="#FFFFFF">
+    <!-- Top-right arm -->
+    <polygon points="724,199 851,199 575,512 449,512"/>
+    <!-- Bottom-left arm -->
+    <polygon points="173,825 300,825 575,512 449,512"/>
+  </g>
+
+  <!-- Connected top-left arm -->
+  <g clip-path="url(#xift-arms-clip)" fill="#FFFFFF">
+    <polygon points="173,199 300,199 575,512 449,512"/>
+  </g>
+
+  <!-- Connected bottom-right magnifying lens handle (rounded terminal) -->
+  <line x1="680" y1="680" x2="806" y2="806" stroke="#FFFFFF" stroke-width="81" stroke-linecap="round"/>
+
+  <!-- Center magnifying ring (punching clean blue interior) -->
+  <circle cx="512" cy="512" r="221.5" fill="url(#xift-bg)" stroke="#FFFFFF" stroke-width="57"/>
+
+  <!-- Inner bold sifted-X geometry (rotated 45 deg around center) -->
+  <g transform="rotate(45 512 512)" fill="#FFFFFF">
+    <!-- Diagonal bar along / -->
+    <rect x="458" y="354" width="108" height="316" rx="14"/>
+    <!-- Upper-left half-bar along \ -->
+    <rect x="354" y="458" width="172" height="108" rx="14"/>
+  </g>
+
+  <!-- Emerald-mint target dot in the lower-right negative space -->
+  <circle cx="600" cy="600" r="41" fill="#3DD3A7"/>
+</svg>
