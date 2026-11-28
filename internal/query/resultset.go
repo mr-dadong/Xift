@@ -188,7 +188,7 @@ func (rs *ResultSet) Viewport(ctx context.Context, offset, limit int) ([]ResultI
 			mtime = cm.ModTime
 		}
 		highlights := computeHighlights(nameBytes, (node.Flags&storage.FlagNonASCII) != 0, posNames)
-		items = append(items, ResultItem{
+		item := ResultItem{
 			NodeID:     r.nodeID,
 			Path:       pathStr,
 			Name:       string(nameBytes),
@@ -202,7 +202,12 @@ func (rs *ResultSet) Viewport(ctx context.Context, offset, limit int) ([]ResultI
 			ModTime:    mtime,
 			Score:      float64(r.score),
 			Highlights: highlights,
-		})
+		}
+		if label, _, ok := rs.snap.SnapshotSource(r.nodeID); ok {
+			item.SnapshotVol = label
+			item.Offline = true
+		}
+		items = append(items, item)
 	}
 	return items, nil
 }

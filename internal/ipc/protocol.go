@@ -46,6 +46,9 @@ const (
 	MsgRecordOpenAck      MsgType = 12
 	MsgApplyFilterRule    MsgType = 13
 	MsgApplyFilterRuleAck MsgType = 14
+	// MsgAdmin carries one JSON administrative operation (snapshot / L2 whitelist).
+	MsgAdmin    MsgType = 15
+	MsgAdminAck MsgType = 16
 )
 
 // FilterRuleAction values carried in ApplyFilterRuleReq.Action.
@@ -206,6 +209,17 @@ type StatusReply struct {
 	LiveCount       uint64
 	ActiveSessions  uint32
 	RejectedConns   uint64
+}
+
+// AdminReq carries one administrative JSON operation, e.g. "snapshot.list".
+type AdminReq struct {
+	Op      string
+	Payload string
+}
+
+// AdminAck carries the JSON result of an AdminReq.
+type AdminAck struct {
+	Payload string
 }
 
 // ErrorResp carries a structured error response for a request.
@@ -435,6 +449,17 @@ func EncodeMessage(msg any) (MsgType, []byte, error) {
 		b = make([]byte, 0, 4)
 		b = binary.LittleEndian.AppendUint32(b, m.AffectedCount)
 		return MsgApplyFilterRuleAck, b, nil
+
+	case *AdminReq:
+		b = make([]byte, 0, 8+len(m.Op)+len(m.Payload))
+		b = appendString(b, m.Op)
+		b = appendString(b, m.Payload)
+		return MsgAdmin, b, nil
+
+	case *AdminAck:
+		b = make([]byte, 0, 4+len(m.Payload))
+		b = appendString(b, m.Payload)
+		return MsgAdminAck, b, nil
 
 	default:
 		return 0, nil, fmt.Errorf("ipc: unsupported message type %T", msg)
@@ -725,6 +750,30 @@ func DecodeMessage(msgType MsgType, payload []byte) (any, error) {
 			ActiveSessions:  active,
 			RejectedConns:   rej,
 		}, nil
+
+	case MsgAdmin:
+		op, err := d.str()
+		if err != nil {
+			return nil, err
+		}
+		payload, err := d.str()
+		if err != nil {
+			return nil, err
+		}
+		if err := d.done(); err != nil {
+			return nil, err
+		}
+		return &AdminReq{Op: op, Payload: payload}, nil
+
+	case MsgAdminAck:
+		payload, err := d.str()
+		if err != nil {
+			return nil, err
+		}
+		if err := d.done(); err != nil {
+			return nil, err
+		}
+		return &AdminAck{Payload: payload}, nil
 
 	case MsgError:
 		code, err := d.u16()

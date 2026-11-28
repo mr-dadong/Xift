@@ -43,6 +43,9 @@ type compiledAtom struct {
 	needleRunes   int
 	extIDs        []uint16
 	extImpossible bool
+	// contentSet holds the L1 node IDs whose body contains this content term.
+	// It is filled by Engine.Start before scanning and is nil when L2 is off.
+	contentSet map[uint32]struct{}
 }
 
 type compiledExpr struct {
@@ -64,6 +67,12 @@ type compiledPlan struct {
 	requiredNames []compiledAtom
 	needsPath     bool
 	needsCold     bool
+	// contentAtoms points at every AtomContent leaf, so Engine.Start can attach
+	// one L2 result set per distinct term before scanning.
+	contentAtoms []*compiledAtom
+	// contentOnly is true when every leaf of the expression is a content term,
+	// so L2's node set can seed candidates instead of scanning the whole index.
+	contentOnly bool
 }
 
 func compileQuery(q *Query, extPool *storage.ExtPool) *compiledPlan {
@@ -78,8 +87,54 @@ func compileQuery(q *Query, extPool *storage.ExtPool) *compiledPlan {
 		p.needsPath = p.root.needsPath
 		p.needsCold = p.root.needsCold
 		p.requiredNames = p.root.requiredNameAtoms(nil)
+		p.contentAtoms = p.root.collectContentAtoms(nil)
+		p.contentOnly = len(p.contentAtoms) > 0 && p.root.allAtomsContent()
 	}
 	return p
+}
+
+// collectContentAtoms gathers pointers to every AtomContent leaf.
+func (ce *compiledExpr) collectContentAtoms(out []*compiledAtom) []*compiledAtom {
+	if ce == nil {
+		return out
+	}
+	switch ce.kind {
+	case ExprAtom:
+		if ce.atom.atom.Kind == AtomContent {
+			out = append(out, &ce.atom)
+		}
+	case ExprAnd, ExprOr:
+		for _, ch := range ce.children {
+			out = ch.collectContentAtoms(out)
+		}
+	case ExprNot:
+		out = ce.child.collectContentAtoms(out)
+	}
+	return out
+}
+
+// allAtomsContent reports whether every leaf is a content term.
+func (ce *compiledExpr) allAtomsContent() bool {
+	if ce == nil {
+		return false
+	}
+	switch ce.kind {
+	case ExprAtom:
+		return ce.atom.atom.Kind == AtomContent
+	case ExprAnd, ExprOr:
+		if len(ce.children) == 0 {
+			return false
+		}
+		for _, ch := range ce.children {
+			if !ch.allAtomsContent() {
+				return false
+			}
+		}
+		return true
+	case ExprNot:
+		return ce.child.allAtomsContent()
+	}
+	return false
 }
 
 // requiredNameAtoms collects name atoms every match of ce must satisfy.
@@ -142,6 +197,8 @@ func compileExpr(e *Expr, extPool *storage.ExtPool, negated bool, posNames *[]co
 			ce.needsPath = true
 		case AtomSize, AtomModTime:
 			ce.needsCold = true
+		case AtomContent:
+			// The candidate set is attached by Engine.Start after L2 lookup.
 		}
 		ce.atom = ca
 	case ExprNot:
@@ -185,6 +242,9 @@ func exprCost(c *compiledExpr) int {
 			return 1
 		case AtomExt:
 			return 2
+		case AtomContent:
+			// Evaluate L1 conditions first; body membership runs last.
+			return 40
 		case AtomWildcard:
 			if c.atom.atom.PureExt != "" {
 				return 2
@@ -362,6 +422,13 @@ func evalAtom(ca *compiledAtom, ec *evalContext) (bool, MatchTier) {
 			return false, TierNone
 		}
 		return ca.atom.ModTime.Matches(cm.ModTime), TierNone
+
+	case AtomContent:
+		if ca.contentSet == nil {
+			return false, TierNone
+		}
+		_, ok := ca.contentSet[ec.nodeID]
+		return ok, TierNone
 
 	default:
 		return false, TierNone

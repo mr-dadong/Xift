@@ -110,6 +110,10 @@ type ResultItem struct {
 	ModTime        int64            `json:"mtime"`
 	Score          float64          `json:"score"`
 	Highlights     []HighlightRange `json:"highlights,omitempty"`
+	// SnapshotVol labels rows served from a mounted read-only volume snapshot;
+	// Offline marks that such rows outlived their source volume.
+	SnapshotVol string `json:"snapshot_vol,omitempty"`
+	Offline     bool   `json:"offline,omitempty"`
 }
 
 // SearchResult holds query execution metadata and the materialized viewport slice.
@@ -148,6 +152,7 @@ func WithFrecency(fp FrecencyProvider) EngineOption {
 type Engine struct {
 	store    *storage.Engine
 	frecency FrecencyProvider
+	content  ContentSearcher
 }
 
 // NewEngine creates a query Engine backed by store.
@@ -184,18 +189,37 @@ func (e *Engine) Start(ctx context.Context, rawQuery string, opts SearchOptions)
 	snap := e.store.AcquireSnapshot()
 	plan := compileQuery(q, e.store.ExtPool())
 
+	empty, contentTrunc, err := e.prepareContent(ctx, q, plan, opts)
+	if err != nil {
+		snap.Release()
+		return nil, err
+	}
+	if empty {
+		snap.Release()
+		return e.emptyResult(q, plan, opts, start), nil
+	}
+
 	if len(q.InDirs) > 0 {
 		rs, err := e.startFoldedSearch(ctx, snap, q, plan, opts, start)
 		snap.Release()
 		return rs, err
 	}
 
-	out, err := scanSnapshot(ctx, snap, plan, opts.Workers, opts.CandidateBudget)
+	var out scanOutcome
+	if plan.contentOnly {
+		budget := 0
+		if snap.Tier2Mode() {
+			budget = opts.CandidateBudget
+		}
+		out, err = contentCandidates(ctx, snap, plan, budget)
+	} else {
+		out, err = scanSnapshot(ctx, snap, plan, opts.Workers, opts.CandidateBudget)
+	}
 	if err != nil {
 		snap.Release()
 		return nil, err
 	}
-	rs, err := e.rankCandidates(ctx, snap, q, plan, out.cands, out.coldReads, false, opts, start, out.truncated, out.verified)
+	rs, err := e.rankCandidates(ctx, snap, q, plan, out.cands, out.coldReads, false, opts, start, out.truncated || contentTrunc, out.verified)
 	if err != nil {
 		snap.Release()
 		return nil, err
@@ -241,6 +265,20 @@ func (e *Engine) Count(ctx context.Context, rawQuery string, opts SearchOptions)
 	snap := e.store.AcquireSnapshot()
 	defer snap.Release()
 	plan := compileQuery(q, e.store.ExtPool())
+	empty, _, err := e.prepareContent(ctx, q, plan, opts)
+	if err != nil {
+		return 0, err
+	}
+	if empty {
+		return 0, nil
+	}
+	if plan.contentOnly {
+		out, err := contentCandidates(ctx, snap, plan, 0)
+		if err != nil {
+			return 0, err
+		}
+		return out.verified, nil
+	}
 	out, err := scanSnapshot(ctx, snap, plan, opts.Workers, 0)
 	if err != nil {
 		return 0, err

@@ -22,6 +22,10 @@ type Config struct {
 	// 128 MB default.
 	BlockCacheBytes int64
 	ServerOptions   ipc.ServerOptions
+	// L2 optionally enables the whitelisted content index. Nil disables it.
+	L2 *L2Config
+	// OnL2Ready is optionally invoked once the content index is open.
+	OnL2Ready func(*L2Pipeline)
 	// OnReady is optionally invoked once the IPC listener is bound and accepting connections.
 	OnReady func(endpoint string)
 }
@@ -49,6 +53,20 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer store.Close()
 
+	var l2p *L2Pipeline
+	if cfg.L2 != nil {
+		var err error
+		l2p, err = OpenL2Pipeline(ctx, dataDir, *cfg.L2)
+		if err != nil {
+			_ = ln.Close()
+			return err
+		}
+		defer l2p.Close()
+		if cfg.OnL2Ready != nil {
+			cfg.OnL2Ready(l2p)
+		}
+	}
+
 	indexDir := filepath.Join(dataDir, "index")
 	frecencyStore, err := query.OpenFrecencyStore(filepath.Join(indexDir, "frecency.db"), query.FrecencyOptions{})
 	if err != nil {
@@ -65,13 +83,19 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	pruner := filter.NewPruner(ruleEng, nil)
 
-	qe := query.NewEngine(store, query.WithFrecency(frecencyStore))
-	backend := ipc.NewQueryBackend(
-		store,
-		qe,
+	qeOpts := []query.EngineOption{query.WithFrecency(frecencyStore)}
+	if l2p != nil {
+		qeOpts = append(qeOpts, query.WithContentSearcher(l2p))
+	}
+	qe := query.NewEngine(store, qeOpts...)
+	backendOpts := []ipc.QueryBackendOption{
 		ipc.WithFrecencyStore(frecencyStore),
 		ipc.WithPruner(pruner, rulesPath),
-	)
+	}
+	if l2p != nil {
+		backendOpts = append(backendOpts, ipc.WithL2Service(l2p))
+	}
+	backend := ipc.NewQueryBackend(store, qe, backendOpts...)
 	srv := ipc.NewServer(backend, cfg.ServerOptions)
 
 	serveErrCh := make(chan error, 1)

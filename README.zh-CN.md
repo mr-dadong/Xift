@@ -280,6 +280,38 @@ xift status
 | `type:file` / `type:dir` | 节点类型 |
 | `in:node_modules lodash` | 按需**深入**被折叠的依赖目录检索，不污染常驻索引 |
 | `all:kernel32` / `sys:` | 解除系统文件降权 |
+| `content:"mutex"` | L2 正文过滤（仅白名单目录），与其余条件 **AND** 求交 |
+
+### 📝 L2 正文检索与离线卷快照
+
+L1 只索引文件名与元数据。可按目录显式加入 L2 白名单，为 UTF-8 文本/代码建立独立的正文索引
+（单文件 ≤ 4 MiB，trigram 倒排 + 精确子串校验）：
+
+```bash
+xift l2 add ~/code          # 加入白名单；启用 L2 的 daemon 在后台分批建索引
+xift l2 status --json       # 白名单、已索引数、跳过计数、磁盘占用/上限、暂停标记
+xift l2 remove ~/code
+xift 'content:"mutex" ext:go'   # 正文条件与所有 L1 条件 AND 求交
+```
+
+- `content:` 只返回文件级结果，不含行号、片段或正文高亮。
+- 被折叠/排除的路径（`node_modules`、`.git`、构建产物）与 L1 一样直接跳过。
+- 变更在 60 秒内可见（3 秒防抖）；建索引期间不阻塞任何 L1 查询。
+- 未配置白名单或 L2 未启用时，`content:` 查询返回空结果并附带明确 warning，绝不静默忽略条件。
+- 资源上限：L2 独立块缓存 16 MiB（不计入 L1），正文索引磁盘上限 4 GiB（达到后暂停写入），单文件 4 MiB。
+
+卷快照把某个卷的条目物化为可移植的只读副本，拔盘后仍可检索：
+
+```bash
+xift snapshot export --volume 1 --out D:\snap-vol1 --label backups
+xift snapshot import D:\snap-vol1
+xift snapshot list --json
+xift snapshot remove 1
+```
+
+包内 `snapshot.json` 记录卷标识/卷标/根路径/导出时间/节点数与每个文件的 crc32c；
+损坏或不完整的包在挂载前即被拒绝。挂载后的条目参与普通查询，结果行标注
+`snapshot_vol` 与 `offline: true`，且永不参与压缩、墓碑清理或写入。
 
 ### 🖥️ 桌面 UI（`xift-ui`）
 

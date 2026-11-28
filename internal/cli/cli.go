@@ -44,6 +44,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return runIndex(ctx, args[1:], stdout, stderr)
 		case "status":
 			return runStatus(ctx, args[1:], stdout, stderr)
+		case "snapshot":
+			return runSnapshot(ctx, args[1:], stdout, stderr)
+		case "l2":
+			return runL2(ctx, args[1:], stdout, stderr)
 		case "search":
 			return runSearch(ctx, args[1:], stdout, stderr)
 		case "-h", "--help", "help":
@@ -66,6 +70,9 @@ Usage:
   xift index [flags] [dir...]         Build/update read-only local Tier 1 index
                                       (Note: do not run xift index while xift-daemon is running)
   xift status [flags]                 Display index or Daemon statistics
+  xift snapshot export|import|list|remove
+                                      Export/import/mount read-only volume snapshots
+  xift l2 add|remove|status           Manage the whitelisted L2 content index
 
 Query DSL examples:
   xift report 2026 ext:pdf,docx !draft

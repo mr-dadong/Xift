@@ -268,6 +268,41 @@ xift status
 | `type:file` / `type:dir` | node type |
 | `in:node_modules lodash` | peek **inside** a folded dependency dir, on demand, no index pollution |
 | `all:kernel32` / `sys:` | lift the system-file demotion |
+| `content:"mutex"` | L2 body filter (whitelisted dirs only), **ANDed** with every other condition |
+
+### 📝 L2 content search & offline volume snapshots
+
+L1 indexes names and metadata only. Opt in per directory to a separate L2
+full-text index of UTF-8 text/code (≤ 4 MiB per file, trigram postings plus exact
+substring verification):
+
+```bash
+xift l2 add ~/code          # whitelist a directory; a daemon started with L2 enabled indexes it in the background
+xift l2 status --json       # roots, indexed docs, skip counters, disk usage/cap, paused
+xift l2 remove ~/code
+xift 'content:"mutex" ext:go'   # body filter ANDed with all L1 conditions
+```
+
+- `content:` returns file-level rows only — no line numbers, snippets or body highlights.
+- Folded/excluded paths (`node_modules`, `.git`, build output) are skipped exactly as in L1.
+- Changes become visible within 60 s (3 s debounce); indexing never blocks L1 queries.
+- Without a whitelist or with L2 disabled, a `content:` query returns an empty result **plus a warning** instead of silently ignoring the filter.
+- Budgets: 16 MiB L2 block cache (independent of L1), 4 GiB content-index disk cap (ingestion pauses at the cap), 4 MiB per file.
+
+A volume snapshot is a portable, read-only materialization of one volume's rows
+that keeps working after the drive is unplugged:
+
+```bash
+xift snapshot export --volume 1 --out D:\snap-vol1 --label backups
+xift snapshot import D:\snap-vol1
+xift snapshot list --json
+xift snapshot remove 1
+```
+
+Packages carry a `snapshot.json` manifest with per-file crc32c checksums; a
+corrupt or incomplete package is rejected before mounting. Mounted rows appear
+in normal queries labelled `snapshot_vol` / `offline: true`, and are never
+compacted, tombstoned or written by the daemon.
 
 ### 🖥️ Desktop UI (`xift-ui`)
 

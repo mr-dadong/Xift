@@ -272,6 +272,19 @@ func (c *Client) ApplyFilterRule(ctx context.Context, action uint8, targetPath s
 	return ack.AffectedCount, nil
 }
 
+// Admin calls one administrative operation and returns its JSON result.
+func (c *Client) Admin(ctx context.Context, op string, payload []byte) ([]byte, error) {
+	msg, err := c.call(ctx, &AdminReq{Op: op, Payload: string(payload)})
+	if err != nil {
+		return nil, err
+	}
+	ack, ok := msg.(*AdminAck)
+	if !ok {
+		return nil, fmt.Errorf("ipc: unexpected Admin response %T", msg)
+	}
+	return []byte(ack.Payload), nil
+}
+
 // IsRPCError reports whether err is an *RPCError with the given code.
 func IsRPCError(err error, code ErrCode) bool {
 	var rpcErr *RPCError

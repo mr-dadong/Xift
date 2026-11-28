@@ -38,6 +38,7 @@ type QueryBackend struct {
 	frecency       *query.FrecencyStore
 	pruner         *filter.Pruner
 	rulesPath      string
+	l2             AdminL2
 	govMu          sync.Mutex
 	totalColdReads atomic.Int64
 }

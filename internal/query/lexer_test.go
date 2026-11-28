@@ -174,12 +174,18 @@ func TestParseMalformedGracefully(t *testing.T) {
 		t.Fatalf("expected nil Root for empty query, got %#v", q.Root)
 	}
 
-	// Reserved L2 content: syntax parses cleanly with a warning.
+	// content: parses into a real atom that ANDs with the other conditions.
 	qc, err := ParseAt(`content:"mutex" ext:go`, now)
 	if err != nil {
-		t.Fatalf("content: should parse cleanly with warning, got %v", err)
+		t.Fatalf("content: should parse cleanly, got %v", err)
 	}
-	if len(qc.ContentTerms) != 1 || qc.ContentTerms[0] != "mutex" || len(qc.Warnings) == 0 {
-		t.Fatalf("expected content term and warning, got terms=%#v warnings=%#v", qc.ContentTerms, qc.Warnings)
+	if len(qc.ContentTerms) != 1 || qc.ContentTerms[0] != "mutex" || len(qc.Warnings) != 0 {
+		t.Fatalf("expected content term and no warning, got terms=%#v warnings=%#v", qc.ContentTerms, qc.Warnings)
+	}
+	if qc.Root == nil || qc.Root.Kind != ExprAnd || len(qc.Root.Children) != 2 {
+		t.Fatalf("expected content: to AND with ext:, got %#v", qc.Root)
+	}
+	if qc.Root.Children[0].Atom.Kind != AtomContent {
+		t.Fatalf("expected first child to be a content atom, got %#v", qc.Root.Children[0].Atom)
 	}
 }

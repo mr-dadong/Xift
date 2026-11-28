@@ -88,6 +88,13 @@ type FilterRuleApplier interface {
 	ApplyFilterRule(ctx context.Context, req ApplyFilterRuleReq) (uint32, error)
 }
 
+// AdminHandler is an optional Backend extension serving administrative JSON
+// operations (snapshot packages and the L2 content whitelist). Unknown
+// operations must return an error; a bad request should wrap ErrBadRequest.
+type AdminHandler interface {
+	Admin(ctx context.Context, op string, payload []byte) ([]byte, error)
+}
+
 // ServerOptions configures IPC Server resource limits and timer injection.
 type ServerOptions struct {
 	MaxConns    int
@@ -461,6 +468,8 @@ func (s *Server) serveConn(cs *connState) {
 			cs.handleRecordOpen(frame.ReqID, req)
 		case *ApplyFilterRuleReq:
 			cs.handleApplyFilterRule(frame.ReqID, req)
+		case *AdminReq:
+			cs.handleAdmin(frame.ReqID, req)
 		default:
 			cs.writeError(frame.ReqID, ErrBadRequest, "unexpected message type")
 		}
@@ -692,6 +701,37 @@ func (cs *connState) handleRecordOpen(reqID uint32, req *RecordOpenReq) {
 			}
 		}
 		_ = cs.writeMessage(reqID, &RecordOpenAck{})
+	}()
+}
+
+func (cs *connState) handleAdmin(reqID uint32, req *AdminReq) {
+	handler, ok := cs.server.backend.(AdminHandler)
+	if !ok {
+		cs.writeError(reqID, ErrBadRequest, "administrative operations are not supported by this daemon")
+		return
+	}
+	select {
+	case cs.reqSem <- struct{}{}:
+	case <-cs.connCtx.Done():
+		return
+	}
+	cs.wg.Add(1)
+	go func() {
+		defer func() {
+			<-cs.reqSem
+			cs.wg.Done()
+		}()
+		out, err := handler.Admin(cs.connCtx, req.Op, []byte(req.Payload))
+		if err != nil {
+			var rpcErr *RPCError
+			if errors.As(err, &rpcErr) {
+				cs.writeError(reqID, rpcErr.Code, rpcErr.Message)
+				return
+			}
+			cs.writeError(reqID, ErrInternal, err.Error())
+			return
+		}
+		_ = cs.writeMessage(reqID, &AdminAck{Payload: string(out)})
 	}()
 }
 

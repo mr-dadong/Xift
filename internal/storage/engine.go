@@ -69,11 +69,14 @@ type Engine struct {
 	extPool          *ExtPool
 	wal              *WAL
 	segments         []*Segment // ordered oldest (base) -> newest (deltas)
-	mem              *MemTable
-	memShared        atomic.Bool // true when at least one Snapshot shares e.mem (CoW on next write)
-	writeGen         uint64      // monotonically incremented under e.mu.Lock on any mutation/segment change
-	openStats        OpenStats
-	blockCache       *lsm.BlockCache
+	// snapshots holds mounted read-only snapshot packages. They participate in
+	// queries through AcquireSnapshot but are never compacted or tombstoned.
+	snapshots  []*snapshotMount
+	mem        *MemTable
+	memShared  atomic.Bool // true when at least one Snapshot shares e.mem (CoW on next write)
+	writeGen   uint64      // monotonically incremented under e.mu.Lock on any mutation/segment change
+	openStats  OpenStats
+	blockCache *lsm.BlockCache
 	// tier2Sticky latches once the engine crosses into Tier 2; every segment
 	// built afterwards carries inverted sidecars so the scan tail cannot grow
 	// back after the live count dips below the threshold.
@@ -330,6 +333,8 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 	if e.tier2Sticky {
 		e.mem.EnableInverted()
 	}
+
+	e.loadSnapshotMounts()
 
 	e.openStats = OpenStats{
 		ReplayedWALCount:      len(replayed),
@@ -1583,22 +1588,41 @@ func (e *Engine) AcquireSnapshot() *Snapshot {
 	if e.closed {
 		return &Snapshot{closed: true}
 	}
-	segs := make([]snapSegment, len(e.segments))
-	for i, s := range e.segments {
+	segs := make([]snapSegment, 0, len(e.segments)+len(e.snapshots))
+	for _, s := range e.segments {
 		s.Retain()
 		delBits, live := s.SnapshotDelBits()
-		segs[i] = snapSegment{
+		segs = append(segs, snapSegment{
 			seg:       s,
 			delBits:   delBits,
 			liveCount: live,
+		})
+	}
+	ranges := make([]snapshotRange, len(e.snapshots))
+	for i, m := range e.snapshots {
+		m.seg.Retain()
+		delBits, live := m.seg.SnapshotDelBits()
+		segs = append(segs, snapSegment{
+			seg:       m.seg,
+			delBits:   delBits,
+			liveCount: live,
+		})
+		ranges[i] = snapshotRange{
+			base:   m.info.BaseNodeID,
+			count:  m.info.Nodes,
+			label:  m.info.VolumeLabel,
+			volID:  m.info.VolumeID,
+			root:   m.info.RootPath,
+			export: m.info.ExportedAt,
 		}
 	}
 	e.memShared.Store(true)
 	return &Snapshot{
-		segs:  segs,
-		mem:   e.mem,
-		gen:   e.writeGen,
-		tier2: e.tier2Sticky,
+		segs:      segs,
+		snapshots: ranges,
+		mem:       e.mem,
+		gen:       e.writeGen,
+		tier2:     e.tier2Sticky,
 	}
 }
 
@@ -1733,6 +1757,7 @@ func (e *Engine) Close() error {
 		s.Release()
 	}
 	e.segments = nil
+	e.releaseSnapshotMountsLocked()
 	if e.blockCache != nil {
 		e.blockCache.Close()
 		e.blockCache = nil
@@ -1742,12 +1767,13 @@ func (e *Engine) Close() error {
 
 // Snapshot provides lock-free, race-free, point-in-time isolated read access to segments and MemTable.
 type Snapshot struct {
-	segs     []snapSegment
-	mem      *MemTable
-	gen      uint64
-	tier2    bool
-	closed   bool
-	released atomic.Bool
+	segs      []snapSegment
+	snapshots []snapshotRange
+	mem       *MemTable
+	gen       uint64
+	tier2     bool
+	closed    bool
+	released  atomic.Bool
 }
 
 // Tier2Mode reports whether the engine was in Tier 2 mode when this snapshot
