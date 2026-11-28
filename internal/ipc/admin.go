@@ -21,6 +21,32 @@ type L2Status struct {
 	DiskCap  int64          `json:"disk_cap"`
 }
 
+// VolumeWatchStatus is the wire form of one volume's live-watch state.
+type VolumeWatchStatus struct {
+	VolID   uint16 `json:"vol_id"`
+	Root    string `json:"root"`
+	State   string `json:"state"`
+	Cursor  uint64 `json:"cursor"`
+	LastErr string `json:"last_error,omitempty"`
+	Rebuilt uint64 `json:"rebuilt"`
+}
+
+// WatchStatus is the wire form of the daemon's live-watch supervision.
+type WatchStatus struct {
+	Enabled bool                `json:"enabled"`
+	Volumes []VolumeWatchStatus `json:"volumes"`
+}
+
+// AdminWatch is implemented by the daemon's live-watch supervisor.
+type AdminWatch interface {
+	WatchStatus() WatchStatus
+}
+
+// WithWatchService attaches the live-watch status service handled by admin RPCs.
+func WithWatchService(w AdminWatch) QueryBackendOption {
+	return func(b *QueryBackend) { b.watch = w }
+}
+
 // AdminL2 is implemented by the daemon's L2 content pipeline.
 type AdminL2 interface {
 	AddRoot(dir string) ([]string, error)
@@ -93,6 +119,12 @@ func (b *QueryBackend) Admin(ctx context.Context, op string, payload []byte) ([]
 			out.Roots = []string{}
 		}
 		return json.Marshal(out)
+
+	case "watch.status":
+		if b.watch == nil {
+			return json.Marshal(WatchStatus{Enabled: false, Volumes: []VolumeWatchStatus{}})
+		}
+		return json.Marshal(b.watch.WatchStatus())
 
 	case "snapshot.list":
 		if b.store == nil {

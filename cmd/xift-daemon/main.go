@@ -25,19 +25,21 @@ var newProvider = func(pruner *filter.Pruner) (provider.FSProvider, error) {
 
 func main() {
 	var (
-		dataDir  string
-		endpoint string
-		enableL2 bool
+		dataDir     string
+		endpoint    string
+		enableL2    bool
+		enableWatch bool
 	)
 	flag.StringVar(&dataDir, "data-dir", storage.DefaultDataDir(), "index data directory")
 	flag.StringVar(&endpoint, "endpoint", "", "IPC endpoint override (default: per-user local endpoint)")
 	flag.BoolVar(&enableL2, "l2", false, "enable the whitelisted L2 content index")
+	flag.BoolVar(&enableWatch, "watch", true, "deliver live kernel file events to the index")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	cfg, err := daemonConfig(ctx, dataDir, endpoint, enableL2)
+	cfg, err := daemonConfig(ctx, dataDir, endpoint, enableL2, enableWatch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "xift-daemon: %v\n", err)
 		os.Exit(1)
@@ -52,9 +54,9 @@ func main() {
 // the same pruning rules as `xift index`, enumerates volumes, and wires the
 // content-index scanner; otherwise no provider is created and no user file is
 // touched.
-func daemonConfig(ctx context.Context, dataDir, endpoint string, enableL2 bool) (daemon.Config, error) {
+func daemonConfig(ctx context.Context, dataDir, endpoint string, enableL2, enableWatch bool) (daemon.Config, error) {
 	cfg := daemon.Config{DataDir: dataDir, Endpoint: endpoint}
-	if !enableL2 {
+	if !enableL2 && !enableWatch {
 		return cfg, nil
 	}
 	if dataDir == "" {
@@ -68,12 +70,27 @@ func daemonConfig(ctx context.Context, dataDir, endpoint string, enableL2 bool) 
 	}
 	prov, err := newProvider(filter.NewPruner(rules, nil))
 	if err != nil {
-		return daemon.Config{}, fmt.Errorf("initialize platform provider: %w", err)
+		if enableL2 {
+			return daemon.Config{}, fmt.Errorf("initialize platform provider: %w", err)
+		}
+		// Watch-only installs keep serving the static index when the platform
+		// has no native provider.
+		cfg.Watch = &daemon.WatchConfig{Enabled: false}
+		return cfg, nil
 	}
-	l2cfg, err := daemon.BuildL2Config(ctx, prov)
+	vols, err := prov.EnumerateVolumes(ctx)
 	if err != nil {
-		return daemon.Config{}, err
+		if enableL2 {
+			return daemon.Config{}, fmt.Errorf("enumerate volumes: %w", err)
+		}
+		cfg.Watch = &daemon.WatchConfig{Enabled: false}
+		return cfg, nil
 	}
-	cfg.L2 = l2cfg
+	if enableL2 {
+		cfg.L2 = daemon.BuildL2ConfigFromVolumes(prov, vols)
+	}
+	if enableWatch {
+		cfg.Watch = &daemon.WatchConfig{Provider: prov, Volumes: vols, Enabled: true}
+	}
 	return cfg, nil
 }
