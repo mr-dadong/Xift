@@ -24,6 +24,8 @@ type Config struct {
 	ServerOptions   ipc.ServerOptions
 	// L2 optionally enables the whitelisted content index. Nil disables it.
 	L2 *L2Config
+	// Watch optionally enables live kernel-event delivery. Nil disables it.
+	Watch *WatchConfig
 	// OnL2Ready is optionally invoked once the content index is open.
 	OnL2Ready func(*L2Pipeline)
 	// OnReady is optionally invoked once the IPC listener is bound and accepting connections.
@@ -67,6 +69,17 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 
+	var watch *liveWatch
+	if cfg.Watch != nil {
+		var err error
+		watch, err = startLiveWatch(ctx, store, *cfg.Watch, l2p)
+		if err != nil {
+			_ = ln.Close()
+			return err
+		}
+		defer watch.Close()
+	}
+
 	indexDir := filepath.Join(dataDir, "index")
 	frecencyStore, err := query.OpenFrecencyStore(filepath.Join(indexDir, "frecency.db"), query.FrecencyOptions{})
 	if err != nil {
@@ -94,6 +107,9 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if l2p != nil {
 		backendOpts = append(backendOpts, ipc.WithL2Service(l2p))
+	}
+	if watch != nil {
+		backendOpts = append(backendOpts, ipc.WithWatchService(watch))
 	}
 	backend := ipc.NewQueryBackend(store, qe, backendOpts...)
 	srv := ipc.NewServer(backend, cfg.ServerOptions)

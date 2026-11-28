@@ -290,7 +290,7 @@ xift 'content:"mutex" ext:go'   # body filter ANDed with all L1 conditions
 - An index written by an older version is renamed to `l2.v1.bak` on open and rebuilt from scratch.
 - Without a whitelist or with L2 disabled, a `content:` query returns an empty result **plus a warning** instead of silently ignoring the filter.
 - Budgets: 16 MiB L2 block cache (independent of L1), 4 GiB content-index disk cap (ingestion pauses at the cap), 4 MiB per file.
-- Enable it on the daemon with `xift-daemon --l2` (off by default; without the flag no whitelisted directory is read). Live watching is not wired yet, so changes made while the daemon runs become visible after a restart or re-adding the directory.
+- Enable it on the daemon with `xift-daemon --l2` (off by default; without the flag no whitelisted directory is read). With the default live watch on, whitelisted changes reach the content index within 60 s.
 
 A volume snapshot is a portable, read-only materialization of one volume's rows
 that keeps working after the drive is unplugged:
@@ -307,13 +307,20 @@ corrupt or incomplete package is rejected before mounting. Mounted rows appear
 in normal queries labelled `snapshot_vol` / `offline: true`, and are never
 compacted, tombstoned or written by the daemon.
 
+The daemon subscribes to each volume's kernel change journal and applies events
+in 150 ms micro-batches, so name changes are visible in well under 300 ms. The
+journal cursor is persisted per volume and resumed after a restart; if the
+journal wrapped, that volume is rebuilt in the background while queries keep
+serving. Volume hot-plug is not detected yet — restart the daemon to pick up a
+new volume.
+
 ### 🖥️ Desktop UI (`xift-ui`)
 
 Start the daemon first, then launch the unprivileged native GPU UI:
 
 ```bash
 # 1. Start the local read-only daemon
-xift-daemon
+xift-daemon             # live watch on by default; --watch=false for a static index
 
 # 2. Launch the desktop search UI (Launcher + Explorer + Tray)
 xift-ui                 # starts in Launcher mode (default)

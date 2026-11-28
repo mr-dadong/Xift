@@ -29,11 +29,12 @@ type StatusOutput struct {
 
 // DaemonStatusOutput is the structured output of `xift status --daemon --json`.
 type DaemonStatusOutput struct {
-	Endpoint        string `json:"endpoint"`
-	ProtocolVersion uint16 `json:"protocol_version"`
-	LiveCount       uint64 `json:"live_count"`
-	ActiveSessions  uint32 `json:"active_sessions"`
-	RejectedConns   uint64 `json:"rejected_conns"`
+	Endpoint        string           `json:"endpoint"`
+	ProtocolVersion uint16           `json:"protocol_version"`
+	LiveCount       uint64           `json:"live_count"`
+	ActiveSessions  uint32           `json:"active_sessions"`
+	RejectedConns   uint64           `json:"rejected_conns"`
+	Watch           *ipc.WatchStatus `json:"watch,omitempty"`
 }
 
 // Run executes the xift CLI with the given arguments and IO streams, returning a process exit code.
@@ -386,6 +387,12 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 			ActiveSessions:  st.ActiveSessions,
 			RejectedConns:   st.RejectedConns,
 		}
+		if payload, aerr := cli.Admin(ctx, "watch.status", nil); aerr == nil {
+			var ws ipc.WatchStatus
+			if json.Unmarshal(payload, &ws) == nil {
+				out.Watch = &ws
+			}
+		}
 		if asJSON {
 			enc := json.NewEncoder(stdout)
 			enc.SetEscapeHTML(false)
@@ -400,6 +407,12 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stdout, "LiveCount:        %d\n", out.LiveCount)
 		fmt.Fprintf(stdout, "ActiveSessions:   %d\n", out.ActiveSessions)
 		fmt.Fprintf(stdout, "RejectedConns:    %d\n", out.RejectedConns)
+		if out.Watch != nil {
+			fmt.Fprintf(stdout, "WatchEnabled:     %t\n", out.Watch.Enabled)
+			for _, v := range out.Watch.Volumes {
+				fmt.Fprintf(stdout, "WatchVol %d:       %s (cursor %d)\n", v.VolID, v.State, v.Cursor)
+			}
+		}
 		return 0
 	}
 

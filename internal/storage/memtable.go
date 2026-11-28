@@ -263,6 +263,19 @@ func (m *MemTable) ForEachLive(fn func(nodeID uint32, node HotNode, name []byte)
 	}
 }
 
+// ForEachKey iterates live MemTable entries as (volID, nodeKey, nodeID).
+func (m *MemTable) ForEachKey(fn func(volID uint16, nodeKey uint64, nodeID uint32) bool) {
+	for i := range m.nodes {
+		n := m.nodes[i]
+		if (n.Flags & FlagDeleted) != 0 {
+			continue
+		}
+		if !fn(n.VolID, m.keys[i], m.nodeIDs[i]) {
+			return
+		}
+	}
+}
+
 // ForEachColdOverride iterates standalone cold metadata overrides.
 func (m *MemTable) ForEachColdOverride(fn func(nodeID uint32, nodeKey uint64, meta ColdMeta) bool) {
 	m.coldOverrides.ForEach(fn)

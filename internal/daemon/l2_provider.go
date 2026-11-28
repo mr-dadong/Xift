@@ -28,6 +28,12 @@ func BuildL2Config(ctx context.Context, prov provider.FSProvider) (*L2Config, er
 	if err != nil {
 		return nil, fmt.Errorf("daemon: enumerate volumes for L2: %w", err)
 	}
+	return BuildL2ConfigFromVolumes(prov, vols), nil
+}
+
+// BuildL2ConfigFromVolumes assembles the L2 configuration from an already
+// enumerated volume set, so start-up enumerates volumes only once.
+func BuildL2ConfigFromVolumes(prov provider.FSProvider, vols []provider.VolumeInfo) *L2Config {
 	volRoots := make(map[uint16]string, len(vols))
 	for _, vol := range vols {
 		volRoots[vol.VolID] = vol.RootPath
@@ -35,7 +41,7 @@ func BuildL2Config(ctx context.Context, prov provider.FSProvider) (*L2Config, er
 	return &L2Config{
 		VolRoots: volRoots,
 		Scanner:  providerScanner{prov: prov, vols: vols},
-	}, nil
+	}
 }
 
 // providerScanner adapts an FSProvider subtree scan to the L2 workspace

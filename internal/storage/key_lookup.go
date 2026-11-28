@@ -54,3 +54,29 @@ func (s *Snapshot) LookupLiveNodeID(volID uint16, nodeKey uint64) (uint32, bool)
 	}
 	return 0, false
 }
+
+// ForEachKey iterates live (volID, nodeKey, nodeID) entries in this snapshot.
+// Mounted read-only snapshot segments are skipped: their keys are package-local
+// placeholders, not filesystem keys.
+func (s *Snapshot) ForEachKey(fn func(volID uint16, nodeKey uint64, nodeID uint32) bool) {
+	if s == nil || s.closed {
+		return
+	}
+	for i := 0; i < s.l1Segs; i++ {
+		ss := s.segs[i]
+		stopped := false
+		ss.seg.ForEachKey(func(volID uint16, nodeKey uint64, nodeID uint32) bool {
+			if !fn(volID, nodeKey, nodeID) {
+				stopped = true
+				return false
+			}
+			return true
+		})
+		if stopped {
+			return
+		}
+	}
+	if s.mem != nil {
+		s.mem.ForEachKey(fn)
+	}
+}

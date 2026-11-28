@@ -39,6 +39,7 @@ type QueryBackend struct {
 	pruner         *filter.Pruner
 	rulesPath      string
 	l2             AdminL2
+	watch          AdminWatch
 	govMu          sync.Mutex
 	totalColdReads atomic.Int64
 }
