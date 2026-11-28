@@ -178,7 +178,7 @@ func (e *Engine) Start(ctx context.Context, rawQuery string, opts SearchOptions)
 		return rs, err
 	}
 
-	cands, coldReads, err := scanSnapshot(ctx, snap, plan, opts.Workers)
+	cands, coldReads, _, err := scanSnapshot(ctx, snap, plan, opts.Workers)
 	if err != nil {
 		snap.Release()
 		return nil, err

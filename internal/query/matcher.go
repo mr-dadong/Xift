@@ -64,6 +64,20 @@ func MatchNameWithFallback(name []byte, isNonASCII bool, needleLower []byte, nee
 	return TierNone
 }
 
+// MatchNameNoFuzzy is MatchNameWithFallback without the discrete-subsequence
+// Fuzzy fallback. Tier 2 trigram candidates are complete for substring and
+// Pinyin hits but cannot cover Fuzzy-only hits, so Tier 2 segments verify with
+// this matcher to keep candidate generation and matching semantics aligned.
+func MatchNameNoFuzzy(name []byte, isNonASCII bool, needleLower []byte, needleLowerStr string) MatchTier {
+	if tier, _, _ := MatchName(name, isNonASCII, needleLower, needleLowerStr); tier != TierNone {
+		return tier
+	}
+	if isNonASCII && isAllASCII(needleLower) && MatchPinyinFast(name, needleLower) {
+		return TierPinyin
+	}
+	return TierNone
+}
+
 // MatchNameHighlights computes the best MatchTier and exact UTF-8 byte HighlightRanges
 // across direct substring, Mandarin Pinyin initials, and Fuzzy subsequence matching.
 func MatchNameHighlights(name []byte, isNonASCII bool, needleLower []byte, needleLowerStr string) (MatchTier, []HighlightRange) {

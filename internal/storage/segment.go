@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/mr-dadong/Xift/internal/storage/lsm"
 )
 
 const (
@@ -22,6 +24,7 @@ const (
 	segMetaEndMagic = uint32(0x54464958) // "XIFT"
 
 	segFlagDense uint32 = 1 << 0
+	segFlagTier2 uint32 = 1 << 1
 )
 
 // SegmentMeta describes an immutable on-disk columnar segment.
@@ -31,6 +34,7 @@ type SegmentMeta struct {
 	NodeCount    uint32
 	NamesBytes   uint64
 	Dense        bool
+	Tier2        bool
 	TombstoneGen uint32
 }
 
@@ -55,6 +59,13 @@ type keyIndexEntry struct {
 }
 
 var _ [16]byte = [unsafe.Sizeof(keyIndexEntry{})]byte{}
+
+// t2NameEntry buffers one name for Tier 2 sorted name-block emission.
+type t2NameEntry struct {
+	fold     string
+	localIdx uint32
+	name     string
+}
 
 // SegmentBuilder streams hot and cold columns to disk for a new immutable Tier 1 segment.
 type SegmentBuilder struct {
@@ -84,14 +95,33 @@ type SegmentBuilder struct {
 	keyEntries []keyIndexEntry
 	dirEntries []keyIndexEntry
 
+	// Tier 2 (LSM inverted) build state.
+	tier2   bool
+	invTri  *lsm.InvertedBuilder
+	invBi   *lsm.InvertedBuilder
+	t2names []t2NameEntry
+	gramBuf []uint64
+
 	hotScratch [HotNodeSize]byte
 	u64Scratch [8]byte
 	u32Scratch [4]byte
 	closed     bool
 }
 
-// NewSegmentBuilder creates a new segment directory and opens column writers for streaming build.
+// NewSegmentBuilder creates a new Tier 1 segment directory and opens column writers for streaming build.
 func NewSegmentBuilder(segDir string, segID uint32, baseNodeID uint32, dense bool, extPool *ExtPool) (*SegmentBuilder, error) {
+	return newSegmentBuilder(segDir, segID, baseNodeID, dense, extPool, false)
+}
+
+// NewTier2SegmentBuilder creates a new Tier 2 (LSM inverted) segment: the
+// standard column files plus names.blk/names.idx, trigram.idx, and bigram.idx.
+// names.col is intentionally omitted — Tier 2 segments are read through the
+// block cache, and pre-P3-01 binaries fail loudly on the missing file.
+func NewTier2SegmentBuilder(segDir string, segID uint32, baseNodeID uint32, dense bool, extPool *ExtPool) (*SegmentBuilder, error) {
+	return newSegmentBuilder(segDir, segID, baseNodeID, dense, extPool, true)
+}
+
+func newSegmentBuilder(segDir string, segID uint32, baseNodeID uint32, dense bool, extPool *ExtPool, tier2 bool) (*SegmentBuilder, error) {
 	if err := os.MkdirAll(segDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create segment dir %s: %w", segDir, err)
 	}
@@ -102,6 +132,11 @@ func NewSegmentBuilder(segDir string, segID uint32, baseNodeID uint32, dense boo
 		baseNodeID: baseNodeID,
 		dense:      dense,
 		extPool:    extPool,
+		tier2:      tier2,
+	}
+	if tier2 {
+		b.invTri = lsm.NewInvertedBuilder()
+		b.invBi = lsm.NewInvertedBuilder()
 	}
 
 	var err error
@@ -109,9 +144,11 @@ func NewSegmentBuilder(segDir string, segID uint32, baseNodeID uint32, dense boo
 		b.Abort()
 		return nil, fmt.Errorf("create hot.col: %w", err)
 	}
-	if b.namesFile, err = os.Create(filepath.Join(segDir, "names.col")); err != nil {
-		b.Abort()
-		return nil, fmt.Errorf("create names.col: %w", err)
+	if !tier2 {
+		if b.namesFile, err = os.Create(filepath.Join(segDir, "names.col")); err != nil {
+			b.Abort()
+			return nil, fmt.Errorf("create names.col: %w", err)
+		}
 	}
 	if b.sizesFile, err = os.Create(filepath.Join(segDir, "sizes.col")); err != nil {
 		b.Abort()
@@ -130,7 +167,9 @@ func NewSegmentBuilder(segDir string, segID uint32, baseNodeID uint32, dense boo
 	}
 
 	b.hotBuf = bufio.NewWriterSize(b.hotFile, 256*1024)
-	b.namesBuf = bufio.NewWriterSize(b.namesFile, 256*1024)
+	if b.namesFile != nil {
+		b.namesBuf = bufio.NewWriterSize(b.namesFile, 256*1024)
+	}
 	b.sizesBuf = bufio.NewWriterSize(b.sizesFile, 128*1024)
 	b.mtimesBuf = bufio.NewWriterSize(b.mtimesFile, 128*1024)
 	return b, nil
@@ -188,9 +227,15 @@ func (b *SegmentBuilder) Append(
 	if _, err := b.hotBuf.Write(b.hotScratch[:]); err != nil {
 		return fmt.Errorf("write hot.col: %w", err)
 	}
-	if nameLen > 0 {
+	if nameLen > 0 && b.namesBuf != nil {
 		if _, err := b.namesBuf.WriteString(name); err != nil {
 			return fmt.Errorf("write names.col: %w", err)
+		}
+	}
+
+	if b.tier2 {
+		if err := b.appendTier2(name, b.count); err != nil {
+			return err
 		}
 	}
 
@@ -304,6 +349,13 @@ func (b *SegmentBuilder) Finish() (SegmentMeta, error) {
 		b.nodeIDsFile = nil
 	}
 
+	if b.tier2 {
+		if err := b.finishTier2(); err != nil {
+			b.closeRemaining()
+			return SegmentMeta{}, err
+		}
+	}
+
 	slices.SortFunc(b.keyEntries, func(a, c keyIndexEntry) int {
 		if a.VolID < c.VolID {
 			return -1
@@ -343,6 +395,7 @@ func (b *SegmentBuilder) Finish() (SegmentMeta, error) {
 		NodeCount:    b.count,
 		NamesBytes:   b.nameOffset,
 		Dense:        b.dense,
+		Tier2:        b.tier2,
 		TombstoneGen: 0,
 	}
 	if err := writeSegmentMeta(filepath.Join(b.dir, "meta.hdr"), meta); err != nil {
@@ -409,6 +462,9 @@ func writeSegmentMeta(path string, meta SegmentMeta) error {
 	if meta.Dense {
 		flags |= segFlagDense
 	}
+	if meta.Tier2 {
+		flags |= segFlagTier2
+	}
 	binary.LittleEndian.PutUint32(buf[16:20], flags)
 	binary.LittleEndian.PutUint32(buf[20:24], meta.BaseNodeID)
 	binary.LittleEndian.PutUint32(buf[24:28], meta.NodeCount)
@@ -443,6 +499,7 @@ func readSegmentMeta(path string) (SegmentMeta, error) {
 	return SegmentMeta{
 		ID:         binary.LittleEndian.Uint32(raw[12:16]),
 		Dense:      (flags & segFlagDense) != 0,
+		Tier2:      (flags & segFlagTier2) != 0,
 		BaseNodeID: binary.LittleEndian.Uint32(raw[20:24]),
 		NodeCount:  binary.LittleEndian.Uint32(raw[24:28]),
 		NamesBytes: binary.LittleEndian.Uint64(raw[28:36]),
@@ -451,6 +508,9 @@ func readSegmentMeta(path string) (SegmentMeta, error) {
 
 // Segment is an opened immutable columnar segment with reference-counted lifecycle and CoW MVCC tombstones.
 // Hot columns are read-only mmap'd; cold columns (sizes.col, mtimes.col) are read strictly via ReadAt.
+// Tier 2 segments replace the hot/names/keys mmaps with block-cache-mediated
+// readers plus trigram/bigram inverted sidecars (memory stays bounded by the
+// shared BlockCache budget regardless of node count).
 type Segment struct {
 	dir  string
 	meta SegmentMeta
@@ -467,6 +527,16 @@ type Segment struct {
 
 	sizesFile  *os.File
 	mtimesFile *os.File
+
+	// Tier 2 state (nil for Tier 1 segments).
+	tier2    bool
+	cache    *lsm.BlockCache
+	hotR     *blockFileReader
+	keysR    *blockFileReader
+	nodeIDsR *blockFileReader
+	namesR   *lsm.NameBlocksReader
+	triIdx   *lsm.InvertedIndex
+	biIdx    *lsm.InvertedIndex
 
 	// Copy-on-Write pointer-free tombstone bitmap (noscan).
 	// Writers hold Engine.mu.Lock; AcquireSnapshot sets delShared under RLock for zero-copy MVCC sharing.
@@ -486,6 +556,16 @@ func OpenSegment(segDir string) (*Segment, error) {
 
 // OpenSegmentWithGen mounts an immutable columnar segment from segDir using the specified tombstone generation.
 func OpenSegmentWithGen(segDir string, tombGen uint32) (*Segment, error) {
+	return openSegment(segDir, tombGen, nil)
+}
+
+// OpenSegmentWithCache mounts a segment routing Tier 2 reads through the
+// shared block cache. A nil cache is equivalent to OpenSegmentWithGen.
+func OpenSegmentWithCache(segDir string, tombGen uint32, cache *lsm.BlockCache) (*Segment, error) {
+	return openSegment(segDir, tombGen, cache)
+}
+
+func openSegment(segDir string, tombGen uint32, cache *lsm.BlockCache) (*Segment, error) {
 	meta, err := readSegmentMeta(filepath.Join(segDir, "meta.hdr"))
 	if err != nil {
 		return nil, err
@@ -493,8 +573,10 @@ func OpenSegmentWithGen(segDir string, tombGen uint32) (*Segment, error) {
 	meta.TombstoneGen = tombGen
 
 	s := &Segment{
-		dir:  segDir,
-		meta: meta,
+		dir:   segDir,
+		meta:  meta,
+		tier2: meta.Tier2,
+		cache: cache,
 	}
 	s.refCount.Store(1)
 
@@ -505,43 +587,13 @@ func OpenSegmentWithGen(segDir string, tombGen uint32) (*Segment, error) {
 		}
 	}()
 
-	if s.hotMap, err = openReadOnlyMmap(filepath.Join(segDir, "hot.col"), mmapAdviceSequential); err != nil {
-		return nil, fmt.Errorf("%w: mmap hot.col: %v", ErrCorruptSegment, err)
-	}
-	if uint64(len(s.hotMap.Bytes())) != uint64(meta.NodeCount)*HotNodeSize {
-		return nil, fmt.Errorf("%w: hot.col size %d != %d", ErrCorruptSegment, len(s.hotMap.Bytes()), uint64(meta.NodeCount)*HotNodeSize)
-	}
-	if meta.NodeCount > 0 {
-		s.nodes = unsafe.Slice((*HotNode)(unsafe.Pointer(&s.hotMap.Bytes()[0])), meta.NodeCount)
-	}
-
-	if s.namesMap, err = openReadOnlyMmap(filepath.Join(segDir, "names.col"), mmapAdviceSequential); err != nil {
-		return nil, fmt.Errorf("%w: mmap names.col: %v", ErrCorruptSegment, err)
-	}
-	if uint64(len(s.namesMap.Bytes())) != meta.NamesBytes {
-		return nil, fmt.Errorf("%w: names.col size %d != %d", ErrCorruptSegment, len(s.namesMap.Bytes()), meta.NamesBytes)
-	}
-	s.names = s.namesMap.Bytes()
-
-	if s.keysMap, err = openReadOnlyMmap(filepath.Join(segDir, "keys.idx"), mmapAdviceRandom); err != nil {
-		return nil, fmt.Errorf("%w: mmap keys.idx: %v", ErrCorruptSegment, err)
-	}
-	if uint64(len(s.keysMap.Bytes())) != uint64(meta.NodeCount)*16 {
-		return nil, fmt.Errorf("%w: keys.idx size %d != %d", ErrCorruptSegment, len(s.keysMap.Bytes()), uint64(meta.NodeCount)*16)
-	}
-	if meta.NodeCount > 0 {
-		s.keys = unsafe.Slice((*keyIndexEntry)(unsafe.Pointer(&s.keysMap.Bytes()[0])), meta.NodeCount)
-	}
-
-	if !meta.Dense {
-		if s.nodeIDsMap, err = openReadOnlyMmap(filepath.Join(segDir, "nodeids.col"), mmapAdviceRandom); err != nil {
-			return nil, fmt.Errorf("%w: mmap nodeids.col: %v", ErrCorruptSegment, err)
+	if s.tier2 {
+		if err := s.openTier2Columns(); err != nil {
+			return nil, err
 		}
-		if uint64(len(s.nodeIDsMap.Bytes())) != uint64(meta.NodeCount)*4 {
-			return nil, fmt.Errorf("%w: nodeids.col size %d != %d", ErrCorruptSegment, len(s.nodeIDsMap.Bytes()), uint64(meta.NodeCount)*4)
-		}
-		if meta.NodeCount > 0 {
-			s.nodeIDs = unsafe.Slice((*uint32)(unsafe.Pointer(&s.nodeIDsMap.Bytes()[0])), meta.NodeCount)
+	} else {
+		if err := s.openTier1Columns(); err != nil {
+			return nil, err
 		}
 	}
 
@@ -604,6 +656,91 @@ func OpenSegmentWithGen(segDir string, tombGen uint32) (*Segment, error) {
 	return s, nil
 }
 
+// openTier1Columns mmaps hot/names/keys/nodeids columns (classic Tier 1 path).
+func (s *Segment) openTier1Columns() error {
+	segDir := s.dir
+	var err error
+	if s.hotMap, err = openReadOnlyMmap(filepath.Join(segDir, "hot.col"), mmapAdviceSequential); err != nil {
+		return fmt.Errorf("%w: mmap hot.col: %v", ErrCorruptSegment, err)
+	}
+	if uint64(len(s.hotMap.Bytes())) != uint64(s.meta.NodeCount)*HotNodeSize {
+		return fmt.Errorf("%w: hot.col size %d != %d", ErrCorruptSegment, len(s.hotMap.Bytes()), uint64(s.meta.NodeCount)*HotNodeSize)
+	}
+	if s.meta.NodeCount > 0 {
+		s.nodes = unsafe.Slice((*HotNode)(unsafe.Pointer(&s.hotMap.Bytes()[0])), s.meta.NodeCount)
+	}
+
+	if s.namesMap, err = openReadOnlyMmap(filepath.Join(segDir, "names.col"), mmapAdviceSequential); err != nil {
+		return fmt.Errorf("%w: mmap names.col: %v", ErrCorruptSegment, err)
+	}
+	if uint64(len(s.namesMap.Bytes())) != s.meta.NamesBytes {
+		return fmt.Errorf("%w: names.col size %d != %d", ErrCorruptSegment, len(s.namesMap.Bytes()), s.meta.NamesBytes)
+	}
+	s.names = s.namesMap.Bytes()
+
+	if s.keysMap, err = openReadOnlyMmap(filepath.Join(segDir, "keys.idx"), mmapAdviceRandom); err != nil {
+		return fmt.Errorf("%w: mmap keys.idx: %v", ErrCorruptSegment, err)
+	}
+	if uint64(len(s.keysMap.Bytes())) != uint64(s.meta.NodeCount)*16 {
+		return fmt.Errorf("%w: keys.idx size %d != %d", ErrCorruptSegment, len(s.keysMap.Bytes()), uint64(s.meta.NodeCount)*16)
+	}
+	if s.meta.NodeCount > 0 {
+		s.keys = unsafe.Slice((*keyIndexEntry)(unsafe.Pointer(&s.keysMap.Bytes()[0])), s.meta.NodeCount)
+	}
+
+	if !s.meta.Dense {
+		if s.nodeIDsMap, err = openReadOnlyMmap(filepath.Join(segDir, "nodeids.col"), mmapAdviceRandom); err != nil {
+			return fmt.Errorf("%w: mmap nodeids.col: %v", ErrCorruptSegment, err)
+		}
+		if uint64(len(s.nodeIDsMap.Bytes())) != uint64(s.meta.NodeCount)*4 {
+			return fmt.Errorf("%w: nodeids.col size %d != %d", ErrCorruptSegment, len(s.nodeIDsMap.Bytes()), uint64(s.meta.NodeCount)*4)
+		}
+		if s.meta.NodeCount > 0 {
+			s.nodeIDs = unsafe.Slice((*uint32)(unsafe.Pointer(&s.nodeIDsMap.Bytes()[0])), s.meta.NodeCount)
+		}
+	}
+	return nil
+}
+
+// openTier2Columns mounts Tier 2 sidecars and record-block readers instead of
+// whole-file mmaps, keeping resident memory bounded by the block cache.
+func (s *Segment) openTier2Columns() error {
+	segDir := s.dir
+	segID := s.meta.ID
+	var err error
+
+	if s.hotR, err = newBlockFileReader(filepath.Join(segDir, "hot.col"), segID, lsm.BlockKindHot, HotNodeSize, s.cache); err != nil {
+		return fmt.Errorf("%w: open hot.col reader: %v", ErrCorruptSegment, err)
+	}
+	if s.hotR.recordCount() != int(s.meta.NodeCount) {
+		return fmt.Errorf("%w: hot.col record count mismatch", ErrCorruptSegment)
+	}
+	if s.keysR, err = newBlockFileReader(filepath.Join(segDir, "keys.idx"), segID, lsm.BlockKindKeys, 16, s.cache); err != nil {
+		return fmt.Errorf("%w: open keys.idx reader: %v", ErrCorruptSegment, err)
+	}
+	if s.keysR.recordCount() != int(s.meta.NodeCount) {
+		return fmt.Errorf("%w: keys.idx record count mismatch", ErrCorruptSegment)
+	}
+	if !s.meta.Dense {
+		if s.nodeIDsR, err = newBlockFileReader(filepath.Join(segDir, "nodeids.col"), segID, lsm.BlockKindNodeIDs, 4, s.cache); err != nil {
+			return fmt.Errorf("%w: open nodeids.col reader: %v", ErrCorruptSegment, err)
+		}
+		if s.nodeIDsR.recordCount() != int(s.meta.NodeCount) {
+			return fmt.Errorf("%w: nodeids.col record count mismatch", ErrCorruptSegment)
+		}
+	}
+	if s.namesR, err = lsm.OpenNameBlocksReader(filepath.Join(segDir, "names.blk"), filepath.Join(segDir, "names.idx"), segID, s.cache); err != nil {
+		return fmt.Errorf("%w: open names.blk: %v", ErrCorruptSegment, err)
+	}
+	if s.triIdx, err = lsm.OpenInvertedIndex(filepath.Join(segDir, "trigram.idx"), segID, s.cache); err != nil {
+		return fmt.Errorf("%w: open trigram.idx: %v", ErrCorruptSegment, err)
+	}
+	if s.biIdx, err = lsm.OpenInvertedIndex(filepath.Join(segDir, "bigram.idx"), segID, s.cache); err != nil {
+		return fmt.Errorf("%w: open bigram.idx: %v", ErrCorruptSegment, err)
+	}
+	return nil
+}
+
 // Retain increments the segment reference count for safe concurrent snapshot access.
 func (s *Segment) Retain() {
 	s.refCount.Add(1)
@@ -652,6 +789,30 @@ func (s *Segment) closeHandles() {
 		_ = s.mtimesFile.Close()
 		s.mtimesFile = nil
 	}
+	if s.hotR != nil {
+		s.hotR.close()
+		s.hotR = nil
+	}
+	if s.keysR != nil {
+		s.keysR.close()
+		s.keysR = nil
+	}
+	if s.nodeIDsR != nil {
+		s.nodeIDsR.close()
+		s.nodeIDsR = nil
+	}
+	if s.namesR != nil {
+		s.namesR.Close()
+		s.namesR = nil
+	}
+	if s.triIdx != nil {
+		s.triIdx.Close()
+		s.triIdx = nil
+	}
+	if s.biIdx != nil {
+		s.biIdx.Close()
+		s.biIdx = nil
+	}
 	s.nodes = nil
 	s.names = nil
 	s.keys = nil
@@ -669,9 +830,23 @@ func (s *Segment) LiveCount() uint32 {
 	return s.meta.NodeCount - s.deadCount
 }
 
+// HotNodes returns the mmap'd hot-node column (Tier 1 only; Tier 2 segments
+// return nil -- scanners must use the inverted index instead).
 func (s *Segment) HotNodes() []HotNode { return s.nodes }
-func (s *Segment) NamesBytes() []byte  { return s.names }
+
+// NamesBytes returns the mmap'd names column (Tier 1 only).
+func (s *Segment) NamesBytes() []byte { return s.names }
+
+// NodeAt returns the HotNode at localIdx. Tier 2 segments read the record
+// through the block cache; on read failure a zero HotNode is returned.
 func (s *Segment) NodeAt(localIdx uint32) HotNode {
+	if s.tier2 {
+		n, err := s.hotR.hotNodeAt(localIdx)
+		if err != nil {
+			return HotNode{}
+		}
+		return n
+	}
 	return s.nodes[localIdx]
 }
 
@@ -679,10 +854,24 @@ func (s *Segment) NodeIDAt(localIdx uint32) uint32 {
 	if s.meta.Dense {
 		return s.meta.BaseNodeID + localIdx
 	}
+	if s.tier2 {
+		id, err := s.nodeIDsR.nodeIDAt(localIdx)
+		if err != nil {
+			return 0
+		}
+		return id
+	}
 	return s.nodeIDs[localIdx]
 }
 
 func (s *Segment) NameBytesAt(localIdx uint32) []byte {
+	if s.tier2 {
+		name, err := s.namesR.NameBytesAt(localIdx)
+		if err != nil {
+			return nil
+		}
+		return name
+	}
 	n := s.nodes[localIdx]
 	start := uint64(n.NameOff)
 	end := start + uint64(n.NameLen)
@@ -813,6 +1002,25 @@ func (s *Segment) lookupNodeIDRaw(nodeID uint32) (uint32, bool) {
 		}
 		return local, true
 	}
+	if s.tier2 {
+		lo, hi := 0, int(s.meta.NodeCount)-1
+		for lo <= hi {
+			mid := int(uint(lo+hi) >> 1)
+			v, err := s.nodeIDsR.nodeIDAt(uint32(mid))
+			if err != nil {
+				return 0, false
+			}
+			if v == nodeID {
+				return uint32(mid), true
+			}
+			if v < nodeID {
+				lo = mid + 1
+			} else {
+				hi = mid - 1
+			}
+		}
+		return 0, false
+	}
 	lo, hi := 0, len(s.nodeIDs)-1
 	for lo <= hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -831,6 +1039,9 @@ func (s *Segment) lookupNodeIDRaw(nodeID uint32) (uint32, bool) {
 
 // LookupByKey binary-searches keys.idx for a live entry matching (volID, nodeKey).
 func (s *Segment) LookupByKey(volID uint16, nodeKey uint64) (nodeID uint32, localIdx uint32, ok bool) {
+	if s.tier2 {
+		return s.lookupByKeyTier2(volID, nodeKey)
+	}
 	n := len(s.keys)
 	if n == 0 {
 		return 0, 0, false
@@ -847,6 +1058,40 @@ func (s *Segment) LookupByKey(volID uint16, nodeKey uint64) (nodeID uint32, loca
 	}
 	for i := lo; i < n; i++ {
 		e := s.keys[i]
+		if e.VolID != volID || e.NodeKey != nodeKey {
+			break
+		}
+		if !s.IsDeleted(e.LocalIdx) {
+			return s.NodeIDAt(e.LocalIdx), e.LocalIdx, true
+		}
+	}
+	return 0, 0, false
+}
+
+// lookupByKeyTier2 binary-searches keys.idx through the block cache.
+func (s *Segment) lookupByKeyTier2(volID uint16, nodeKey uint64) (uint32, uint32, bool) {
+	n := int(s.meta.NodeCount)
+	if n == 0 {
+		return 0, 0, false
+	}
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		e, err := s.keysR.keyEntryAt(uint32(mid))
+		if err != nil {
+			return 0, 0, false
+		}
+		if e.VolID < volID || (e.VolID == volID && e.NodeKey < nodeKey) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	for i := lo; i < n; i++ {
+		e, err := s.keysR.keyEntryAt(uint32(i))
+		if err != nil {
+			return 0, 0, false
+		}
 		if e.VolID != volID || e.NodeKey != nodeKey {
 			break
 		}
@@ -925,14 +1170,27 @@ func (c *coldStream) Close() {
 	}
 }
 
-// PopulateLocalKeys fills dst[localIdx] = NodeKey from keys.idx in a single pass (used by Compact).
-func (s *Segment) PopulateLocalKeys(dst []uint64) {
+// PopulateLocalKeys fills dst[localIdx] = NodeKey from keys.idx in a single
+// pass (used by Compact). A read error is returned instead of leaving zero keys
+// behind, which would otherwise be persisted into a merged segment.
+func (s *Segment) PopulateLocalKeys(dst []uint64) error {
+	if s.tier2 {
+		return s.keysR.forEachRecord(func(rec []byte, _ int) bool {
+			nodeKey := binary.LittleEndian.Uint64(rec[0:8])
+			localIdx := binary.LittleEndian.Uint32(rec[8:12])
+			if int(localIdx) < len(dst) {
+				dst[localIdx] = nodeKey
+			}
+			return true
+		})
+	}
 	for i := range s.keys {
 		e := s.keys[i]
 		if int(e.LocalIdx) < len(dst) {
 			dst[e.LocalIdx] = e.NodeKey
 		}
 	}
+	return nil
 }
 
 // PopulateDirMap loads live directory mappings from dirs.col into dirMap without touching hot.col or keys.idx.
@@ -951,6 +1209,9 @@ func (s *Segment) PopulateDirMap(dirMap *KeyMap) error {
 			}
 		}
 		return nil
+	}
+	if s.tier2 {
+		return nil // dirs.col is always written for Tier 2 segments.
 	}
 	for i := range s.keys {
 		e := s.keys[i]
@@ -972,7 +1233,7 @@ func (s *Segment) ForEachLiveWithDel(delBits []uint64, fn func(nodeID uint32, no
 		if isBitSet(delBits, s.meta.NodeCount, i) {
 			continue
 		}
-		n := s.nodes[i]
+		n := s.NodeAt(i)
 		name := s.NameBytesAt(i)
 		if !fn(s.NodeIDAt(i), n, name) {
 			return
@@ -982,6 +1243,18 @@ func (s *Segment) ForEachLiveWithDel(delBits []uint64, fn func(nodeID uint32, no
 
 // ForEachKey iterates all live (volID, nodeKey, nodeID) entries from keys.idx.
 func (s *Segment) ForEachKey(fn func(volID uint16, nodeKey uint64, nodeID uint32) bool) {
+	if s.tier2 {
+		_ = s.keysR.forEachRecord(func(rec []byte, _ int) bool {
+			nodeKey := binary.LittleEndian.Uint64(rec[0:8])
+			localIdx := binary.LittleEndian.Uint32(rec[8:12])
+			volID := binary.LittleEndian.Uint16(rec[12:14])
+			if localIdx >= s.meta.NodeCount || s.IsDeleted(localIdx) {
+				return true
+			}
+			return fn(volID, nodeKey, s.NodeIDAt(localIdx))
+		})
+		return
+	}
 	for i := range s.keys {
 		e := s.keys[i]
 		if e.LocalIdx >= s.meta.NodeCount || s.IsDeleted(e.LocalIdx) {

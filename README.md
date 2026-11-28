@@ -94,6 +94,22 @@ Below 5M files: `mmap` columns. Above that: an LSM + Trigram engine behind a **f
 | Cross-compile matrix (win/linux/darwin × amd64/arm64) | **6 / 6 green** | 6 / 6 |
 | Data races under `-race` (storage / query / cli) | **0** | 0 |
 
+### 🗄️ Tier 2 (disk LSM + trigram) — measured with `xift-bench`
+
+`CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30` on Windows 11 + NVMe:
+
+| Metric | Result |
+| :--- | ---: |
+| Build 1.1M nodes (Dense Tier 2 segment) | **2.89 s** |
+| Index size on disk | **120.8 MiB** |
+| Cold start (reopen) | **4.8 ms** |
+| Selective query p50 / p95 | **< 0.01 ms / 1.5 ms** |
+| Wide-match synthetic query p50 | **106 ms** (≈100k hits, full ranking — see note) |
+| Query-time RSS with a 128 MB cache | **99.5 MiB** |
+| Build peak RSS | **462 MiB** |
+
+> The wide-match number is a deliberately adversarial synthetic corpus where 10% of all names share one token; realistic selective terms stay in the sub-millisecond range.
+
 ### 🎯 Design SLAs
 
 | Dimension | Tier 1 · ~1M effective files | Tier 2 · 100M files | Everything (reference) |
@@ -154,6 +170,10 @@ type HotNode struct {
 ```
 
 Moving a directory with **500,000 children** means rewriting **one `uint32`**. Deleting a file in Tier 2 means flipping **one bit**.
+
+### 🗄️ Tier 2 storage (≥ 5M live nodes)
+
+Above 5M live nodes (or in low-memory mode) new segments switch to the Tier 2 layout: trigram/bigram inverted sidecars (pinyin-initials indexed in a separate namespace), front-coded name blocks, and **block-cache-only reads** — no whole-file `mmap`, so resident memory is bounded by the 128 MB sharded LRU cache regardless of index size. Live changes only touch the MemTable and tombstone bits; a low-priority background worker rebuilds Tier 1 segments into Tier 2 and merges the oldest segments once there are more than eight. Fuzzy (discrete-subsequence) matching is intentionally Tier 1 only: trigram postings cannot bound it without a scan.
 
 ### 🌪️ Storm-proof event pipeline
 
@@ -332,6 +352,11 @@ CGO_ENABLED=1 go test -race -count=1 ./internal/...
 
 # Benchmarks
 CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
+
+# Tier 2 end-to-end synthetic benchmark (build / disk / cold start / latency / RSS)
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 100000000 -dirs 10000000 -queries 50
+#   extra flags: -data-dir <dir> -keep -tier2=false -cache-bytes <n> -terms 'a|b' -json
 ```
 
 <details>
@@ -341,6 +366,7 @@ CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
 Xift/
 ├── cmd/
 │   ├── xift/              # CLI
+│   ├── xift-bench/        # synthetic Tier 2 benchmark (build/disk/latency/RSS)
 │   ├── xift-daemon/       # background indexing daemon
 │   └── xift-ui/           # MyGo native desktop UI (Launcher + Explorer)
 ├── internal/

@@ -36,6 +36,16 @@ func NewManifest() *Manifest {
 	}
 }
 
+// HasTier2 reports whether any committed segment carries Tier 2 sidecars.
+func (m *Manifest) HasTier2() bool {
+	for i := range m.Segments {
+		if m.Segments[i].Tier2 {
+			return true
+		}
+	}
+	return false
+}
+
 // Clone returns a deep copy of Manifest.
 func (m *Manifest) Clone() *Manifest {
 	cp := *m
@@ -131,6 +141,7 @@ func LoadManifest(path string) (*Manifest, bool, error) {
 			NodeCount:    binary.LittleEndian.Uint32(payload[off+8 : off+12]),
 			NamesBytes:   binary.LittleEndian.Uint64(payload[off+12 : off+20]),
 			Dense:        (payload[off+20] & 1) != 0,
+			Tier2:        (payload[off+20] & 2) != 0,
 			TombstoneGen: binary.LittleEndian.Uint32(payload[off+21 : off+25]),
 		}
 		off += manifestSegSize
@@ -207,7 +218,10 @@ func (m *Manifest) Save(path string) error {
 		binary.LittleEndian.PutUint32(buf[off+8:off+12], sm.NodeCount)
 		binary.LittleEndian.PutUint64(buf[off+12:off+20], sm.NamesBytes)
 		if sm.Dense {
-			buf[off+20] = 1
+			buf[off+20] |= 1
+		}
+		if sm.Tier2 {
+			buf[off+20] |= 2
 		}
 		binary.LittleEndian.PutUint32(buf[off+21:off+25], sm.TombstoneGen)
 		off += manifestSegSize

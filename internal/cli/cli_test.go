@@ -70,6 +70,12 @@ func TestCLIEndToEndIndexSearchJSONPipeAndFoldedIn(t *testing.T) {
 	if status.LiveCount == 0 || status.RecommendedTier != "tier1-mmap" {
 		t.Fatalf("unexpected status: %+v", status)
 	}
+	if status.ActiveTier != "tier1-mmap" {
+		t.Fatalf("active tier = %q, want tier1-mmap", status.ActiveTier)
+	}
+	if status.BlockCacheLimit != 128<<20 {
+		t.Fatalf("block cache limit = %d, want %d", status.BlockCacheLimit, 128<<20)
+	}
 
 	// 3. Default pipe mode: one path per line, no decoration.
 	out.Reset()

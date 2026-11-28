@@ -94,6 +94,22 @@ Windows 用 NTFS MFT + USN Journal，macOS 用 `getattrlistbulk` + FSEvents，Li
 | 交叉编译矩阵（win/linux/darwin × amd64/arm64） | **6 / 6 全绿** | 6 / 6 |
 | `-race` 竞态检测（storage / query / cli） | **0** | 0 |
 
+### 🗄️ Tier 2（磁盘 LSM + Trigram）— `xift-bench` 实测
+
+`CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30`（Windows 11 + NVMe）：
+
+| 指标 | 结果 |
+| :--- | ---: |
+| 构建 110 万节点（Dense Tier 2 段） | **2.89 s** |
+| 索引磁盘占用 | **120.8 MiB** |
+| 冷启动（重新打开） | **4.8 ms** |
+| 选择性查询 p50 / p95 | **< 0.01 ms / 1.5 ms** |
+| 宽匹配合成查询 p50 | **106 ms**（约 10 万命中、全量排序，见注） |
+| 128 MB 块缓存下的查询态 RSS | **99.5 MiB** |
+| 构建峰值 RSS | **462 MiB** |
+
+> 宽匹配数字来自刻意构造的对抗性合成语料（10% 名称共享同一词元）；真实选择性词项处于亚毫秒级。
+
 ### 🎯 设计 SLA
 
 | 维度 | Tier 1 · 约 100 万有效文件 | Tier 2 · 1 亿文件 | Everything（参照） |
@@ -154,6 +170,10 @@ type HotNode struct {
 ```
 
 移动一个含 **50 万子文件**的目录，只需改写 **1 个 `uint32`**；在 Tier 2 中删除一个文件，只需翻转 **1 个 bit**。
+
+### 🗄️ Tier 2 存储（≥ 500 万有效节点）
+
+有效节点超过 500 万（或低内存模式）后，新段切换到 Tier 2 布局：trigram/bigram 倒排旁挂文件（拼音首字母单独命名空间）、Front Coding 名称块，且**所有读取只走块缓存**——不再整文件 `mmap`，常驻内存由 128 MB 分片 LRU 缓存硬性封顶，与索引规模无关。实时变更只写 MemTable 与墓碑位；低优先级后台 worker 负责把 Tier 1 段重建为 Tier 2，并在段数超过 8 时合并最旧段。fuzzy（乱序子序列）仅保留在 Tier 1：trigram posting 无法在不全扫的前提下覆盖它。
 
 ### 🌪️ 抗风暴事件流水线
 
@@ -332,6 +352,11 @@ CGO_ENABLED=1 go test -race -count=1 ./internal/...
 
 # 基准测试
 CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
+
+# Tier 2 端到端合成压测（构建 / 磁盘 / 冷启动 / 延迟 / RSS）
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 100000000 -dirs 10000000 -queries 50
+#   其他参数：-data-dir <dir> -keep -tier2=false -cache-bytes <n> -terms 'a|b' -json
 ```
 
 <details>
@@ -341,6 +366,7 @@ CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
 Xift/
 ├── cmd/
 │   ├── xift/              # 命令行
+│   ├── xift-bench/        # Tier 2 合成压测（构建/磁盘/延迟/RSS）
 │   ├── xift-daemon/       # 后台索引守护进程
 │   └── xift-ui/           # MyGo 原生桌面 UI（Launcher + Explorer）
 ├── internal/

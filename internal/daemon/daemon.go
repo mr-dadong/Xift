@@ -16,9 +16,12 @@ import (
 
 // Config configures the Core Daemon query service.
 type Config struct {
-	DataDir       string
-	Endpoint      string
-	ServerOptions ipc.ServerOptions
+	DataDir  string
+	Endpoint string
+	// BlockCacheBytes caps the shared Tier 2 block cache; zero selects the
+	// 128 MB default.
+	BlockCacheBytes int64
+	ServerOptions   ipc.ServerOptions
 	// OnReady is optionally invoked once the IPC listener is bound and accepting connections.
 	OnReady func(endpoint string)
 }
@@ -39,7 +42,7 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	store, err := storage.Open(dataDir, storage.Options{})
+	store, err := storage.Open(dataDir, storage.Options{BlockCacheBytes: cfg.BlockCacheBytes})
 	if err != nil {
 		_ = ln.Close()
 		return fmt.Errorf("daemon: open index %q: %w", dataDir, err)

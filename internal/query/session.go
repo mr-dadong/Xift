@@ -100,9 +100,13 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 
 	var cands []candidate
 	var coldReads int
+	partial := false
 	incremental := false
 
-	if hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q) {
+	// Session incremental narrowing has the highest routing priority; the
+	// per-segment router only runs when no reusable cache applies.
+	sessionIncremental := hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q)
+	if routeQuery(plan, storage.SegmentSnapshot{}, sessionIncremental) == routeIncremental {
 		cands, coldReads, err = refineCandidates(runCtx, snap, cachedCands, plan)
 		if err != nil {
 			snap.Release()
@@ -110,15 +114,17 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 		}
 		incremental = true
 	} else {
-		cands, coldReads, err = scanSnapshot(runCtx, snap, plan, opts.Workers)
+		cands, coldReads, partial, err = scanSnapshot(runCtx, snap, plan, opts.Workers)
 		if err != nil {
 			snap.Release()
 			return nil, err
 		}
 	}
 
-	// Store compact candidate snapshot for next incremental keystroke if within budget.
-	if len(cands) <= maxCachedSessionCandidates {
+	// Store compact candidate snapshot for next incremental keystroke if within
+	// budget. Truncated short-word results are partial and must not seed the
+	// next keystroke, or the 2->3 rune transition could miss hits.
+	if len(cands) <= maxCachedSessionCandidates && !partial && !containsPartialCandidates(cands) {
 		cacheCopy := make([]candidate, len(cands))
 		copy(cacheCopy, cands)
 		s.mu.Lock()
@@ -192,6 +198,7 @@ func refineCandidates(
 			node:      node,
 			name:      name,
 			nonASCII:  (node.Flags & storage.FlagNonASCII) != 0,
+			noFuzzy:   c.tier2,
 			coldReady: c.hasCold,
 			coldMeta:  storage.ColdMeta{Size: c.size, ModTime: c.modTime},
 			coldReads: &coldReads,
@@ -204,6 +211,7 @@ func refineCandidates(
 				volID:    node.VolID,
 				nameLen:  node.NameLen,
 				bestTier: tier,
+				tier2:    c.tier2,
 			}
 			if ec.coldReady {
 				next.hasCold = true
@@ -214,6 +222,17 @@ func refineCandidates(
 		}
 	}
 	return out, int(coldReads), nil
+}
+
+// containsPartialCandidates reports whether any candidate came from a
+// truncated (incomplete) scan path.
+func containsPartialCandidates(cands []candidate) bool {
+	for i := range cands {
+		if cands[i].partial {
+			return true
+		}
+	}
+	return false
 }
 
 // isNarrowingQuery conservatively checks whether every node matching next is guaranteed
