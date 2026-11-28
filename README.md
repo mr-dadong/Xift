@@ -290,6 +290,7 @@ xift 'content:"mutex" ext:go'   # body filter ANDed with all L1 conditions
 - An index written by an older version is renamed to `l2.v1.bak` on open and rebuilt from scratch.
 - Without a whitelist or with L2 disabled, a `content:` query returns an empty result **plus a warning** instead of silently ignoring the filter.
 - Budgets: 16 MiB L2 block cache (independent of L1), 4 GiB content-index disk cap (ingestion pauses at the cap), 4 MiB per file.
+- Enable it on the daemon with `xift-daemon --l2` (off by default; without the flag no whitelisted directory is read). Live watching is not wired yet, so changes made while the daemon runs become visible after a restart or re-adding the directory.
 
 A volume snapshot is a portable, read-only materialization of one volume's rows
 that keeps working after the drive is unplugged:

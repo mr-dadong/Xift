@@ -92,6 +92,16 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 	snap := s.engine.store.AcquireSnapshot()
 	plan := compileQuery(q, s.engine.store.ExtPool())
 
+	empty, contentTrunc, err := s.engine.prepareContent(runCtx, q, plan, opts)
+	if err != nil {
+		snap.Release()
+		return nil, err
+	}
+	if empty {
+		snap.Release()
+		return s.engine.emptyResult(q, plan, opts, start), nil
+	}
+
 	if len(q.InDirs) > 0 {
 		rs, err := s.engine.startFoldedSearch(runCtx, snap, q, plan, opts, start)
 		snap.Release()
@@ -101,14 +111,27 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 	var cands []candidate
 	var coldReads int
 	partial := false
-	truncated := false
+	truncated := contentTrunc
 	verified := 0
 	incremental := false
 
-	// Session incremental narrowing has the highest routing priority; the
-	// per-segment router only runs when no reusable cache applies.
-	sessionIncremental := hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q)
-	if routeQuery(plan, storage.SegmentSnapshot{}, sessionIncremental) == routeIncremental {
+	// Session incremental narrowing has the highest routing priority, but a
+	// content-only query is seeded from L2 and never narrows a cached L1 set.
+	sessionIncremental := !plan.contentOnly && hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q)
+	switch {
+	case plan.contentOnly:
+		budget := 0
+		if snap.Tier2Mode() {
+			budget = opts.CandidateBudget
+		}
+		out, scanErr := contentCandidates(runCtx, snap, plan, budget)
+		if scanErr != nil {
+			snap.Release()
+			return nil, scanErr
+		}
+		cands, coldReads, partial = out.cands, out.coldReads, out.partial
+		truncated, verified = truncated || out.truncated, out.verified
+	case routeQuery(plan, storage.SegmentSnapshot{}, sessionIncremental) == routeIncremental:
 		cands, coldReads, err = refineCandidates(runCtx, snap, cachedCands, plan)
 		if err != nil {
 			snap.Release()
@@ -116,21 +139,21 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 		}
 		verified = len(cands)
 		incremental = true
-	} else {
+	default:
 		out, scanErr := scanSnapshot(runCtx, snap, plan, opts.Workers, opts.CandidateBudget)
 		if scanErr != nil {
 			snap.Release()
 			return nil, scanErr
 		}
 		cands, coldReads, partial = out.cands, out.coldReads, out.partial
-		truncated, verified = out.truncated, out.verified
+		truncated, verified = out.truncated || truncated, out.verified
 	}
 
 	// Store compact candidate snapshot for next incremental keystroke if within
 	// budget. Truncated results (short-word path or candidate budget) are
 	// incomplete and must not seed the next keystroke, or the 2->3 rune
 	// transition could miss hits.
-	if len(cands) <= maxCachedSessionCandidates && !partial && !truncated && !containsPartialCandidates(cands) {
+	if !plan.contentOnly && len(cands) <= maxCachedSessionCandidates && !partial && !truncated && !containsPartialCandidates(cands) {
 		cacheCopy := make([]candidate, len(cands))
 		copy(cacheCopy, cands)
 		s.mu.Lock()
