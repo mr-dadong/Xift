@@ -45,6 +45,7 @@ func runL2(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return runL2StatusCmd(ctx, args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		fmt.Fprintln(stdout, "Usage: xift l2 add <dir> | remove <dir> | status [--data-dir <dir>] [--json]")
+		fmt.Fprintln(stdout, "add whitelists a directory; a running daemon scans and indexes it immediately.")
 		return 0
 	default:
 		fmt.Fprintf(stderr, "xift l2: unknown subcommand %q\n", sub)

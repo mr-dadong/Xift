@@ -102,3 +102,11 @@ func (p *Provider) ScanSubtree(ctx context.Context, vol provider.VolumeInfo, dir
 	}
 	return p.scanTopDownLinux(ctx, vol, dirPath, dirKey, false, writer)
 }
+
+// ScanSubtreeWithRoot resolves the root inode and emits the root record first.
+func (p *Provider) ScanSubtreeWithRoot(ctx context.Context, vol provider.VolumeInfo, dirPath string, writer provider.SegmentWriter) error {
+	if dirPath == "" || writer == nil {
+		return provider.ErrInvalidVolume
+	}
+	return p.scanTopDownLinux(ctx, vol, dirPath, 0, true, writer)
+}

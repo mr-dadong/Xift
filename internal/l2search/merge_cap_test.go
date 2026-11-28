@@ -22,8 +22,8 @@ func TestSegmentMergeEquivalence(t *testing.T) {
 	// others are stable.
 	for i := 0; i < 9; i++ {
 		docs := []Doc{
-			{NodeID: uint32(100 + i), MTime: int64(i), Text: []byte("stable mutex entry")},
-			{NodeID: 500, MTime: int64(i), Text: []byte("mutex generation")},
+			{Key: DocKey{VolID: 1, NodeKey: uint64(100 + i)}, MTime: int64(i), Text: []byte("stable mutex entry")},
+			{Key: DocKey{VolID: 1, NodeKey: 500}, MTime: int64(i), Text: []byte("mutex generation")},
 		}
 		if err := st.AddSegment(docs); err != nil {
 			t.Fatalf("AddSegment %d: %v", i, err)
@@ -70,7 +70,7 @@ func TestDiskCapPauses(t *testing.T) {
 	defer st.Close()
 
 	st.SetDiskCap(100)
-	err = st.AddSegment([]Doc{{NodeID: 1, Text: []byte("some mutex content that exceeds the tiny cap")}})
+	err = st.AddSegment([]Doc{{Key: DocKey{VolID: 1, NodeKey: 1}, Text: []byte("some mutex content that exceeds the tiny cap")}})
 	if !errors.Is(err, ErrDiskCap) {
 		t.Fatalf("AddSegment err = %v, want ErrDiskCap", err)
 	}
@@ -82,7 +82,7 @@ func TestDiskCapPauses(t *testing.T) {
 	}
 
 	st.SetDiskCap(1 << 20)
-	if err := st.AddSegment([]Doc{{NodeID: 1, Text: []byte("fits now")}}); err != nil {
+	if err := st.AddSegment([]Doc{{Key: DocKey{VolID: 1, NodeKey: 1}, Text: []byte("fits now")}}); err != nil {
 		t.Fatalf("AddSegment after raising cap: %v", err)
 	}
 	if st.Paused() {
@@ -97,8 +97,7 @@ func TestAutoMergeAfterIndex(t *testing.T) {
 	for i := 0; i < 12; i++ {
 		writeFile(t, filepath.Join(root, "f", pathName(i)), "merge marker text")
 	}
-	res := newFakeResolver()
-	ws, st := openWorkspace(t, WSOptions{Resolver: res, BatchDocs: 1})
+	ws, st := openWorkspace(t, WSOptions{BatchDocs: 1})
 	ws.AddRoot(root)
 	if err := ws.IndexRoot(context.Background(), root); err != nil {
 		t.Fatalf("IndexRoot: %v", err)
@@ -124,8 +123,7 @@ func TestDeleteAfterAutoMerge(t *testing.T) {
 		paths[i] = filepath.Join(root, "f", pathName(i))
 		writeFile(t, paths[i], "survivor marker")
 	}
-	res := newFakeResolver()
-	ws, st := openWorkspace(t, WSOptions{Resolver: res, BatchDocs: 1, Debounce: time.Millisecond})
+	ws, st := openWorkspace(t, WSOptions{BatchDocs: 1, Debounce: time.Millisecond})
 	ws.AddRoot(root)
 	if err := ws.IndexRoot(context.Background(), root); err != nil {
 		t.Fatalf("IndexRoot: %v", err)
@@ -134,7 +132,8 @@ func TestDeleteAfterAutoMerge(t *testing.T) {
 		t.Fatalf("segments = %d, want 1 after auto-merge", got)
 	}
 
-	ws.EnqueueDelete(paths[3])
+	deletedKey := DocKey{VolID: 1, NodeKey: stablePathKey(paths[3])}
+	ws.EnqueueEvent(deletedKey, paths[3], 0, false)
 	time.Sleep(5 * time.Millisecond)
 	ws.flushIfDue(context.Background())
 
@@ -146,7 +145,7 @@ func TestDeleteAfterAutoMerge(t *testing.T) {
 		t.Fatalf("search ids after delete = %d, want 11", len(ids))
 	}
 	for _, id := range ids {
-		if id == res.idOf(paths[3]) {
+		if id == deletedKey {
 			t.Fatal("deleted document survived auto-merge")
 		}
 	}

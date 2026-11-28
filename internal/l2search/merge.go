@@ -1,6 +1,7 @@
 package l2search
 
 import (
+	"encoding/binary"
 	"os"
 	"slices"
 )
@@ -42,35 +43,35 @@ func (s *Store) Merge() error {
 	return err
 }
 
-// MergeWithLocations is Merge plus the node -> new document position map.
-func (s *Store) MergeWithLocations() (map[uint32]DocPos, error) {
+// MergeWithLocations is Merge plus the document key -> new position map.
+func (s *Store) MergeWithLocations() (map[DocKey]DocPos, error) {
 	return s.merge()
 }
 
-// DocNodeID returns the node ID stored at (segID, local).
-func (s *Store) DocNodeID(segID, local uint32) (uint32, bool) {
+// DocKeyAt returns the document key stored at (segID, local).
+func (s *Store) DocKeyAt(segID, local uint32) (DocKey, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	seg := s.segmentByIDLocked(segID)
 	if seg == nil {
-		return 0, false
+		return DocKey{}, false
 	}
 	rec, ok := docForSeg(seg, local)
 	if !ok {
-		return 0, false
+		return DocKey{}, false
 	}
-	return rec.NodeID, true
+	return rec.Key, true
 }
 
-func (s *Store) merge() (map[uint32]DocPos, error) {
+func (s *Store) merge() (map[DocKey]DocPos, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.segs) <= 1 {
 		return nil, nil
 	}
 
-	newest := make(map[uint32]Doc)
-	gens := make(map[uint32]uint32)
+	newest := make(map[DocKey]Doc)
+	gens := make(map[DocKey]uint32)
 	for _, seg := range s.segs {
 		for local := uint32(0); local < seg.meta.Docs; local++ {
 			if seg.isDead(local) {
@@ -80,30 +81,67 @@ func (s *Store) merge() (map[uint32]DocPos, error) {
 			if !ok {
 				continue
 			}
-			if gen, seen := gens[rec.NodeID]; seen && gen > rec.Gen {
+			if gen, seen := gens[rec.Key]; seen && gen > rec.Gen {
 				continue
 			}
 			text, ok := contentForSeg(seg, local)
 			if !ok {
 				continue
 			}
-			newest[rec.NodeID] = Doc{NodeID: rec.NodeID, MTime: rec.MTime, Text: text}
-			gens[rec.NodeID] = rec.Gen
+			newest[rec.Key] = Doc{Key: rec.Key, MTime: rec.MTime, Text: text}
+			gens[rec.Key] = rec.Gen
 		}
 	}
 
-	ids := make([]uint32, 0, len(newest))
-	for id := range newest {
-		ids = append(ids, id)
+	keys := make([]DocKey, 0, len(newest))
+	for key := range newest {
+		keys = append(keys, key)
 	}
-	slices.Sort(ids)
-	docs := make([]Doc, 0, len(ids))
-	for _, id := range ids {
-		docs = append(docs, newest[id])
+	slices.SortFunc(keys, func(a, b DocKey) int {
+		if a.VolID != b.VolID {
+			if a.VolID < b.VolID {
+				return -1
+			}
+			return 1
+		}
+		switch {
+		case a.NodeKey < b.NodeKey:
+			return -1
+		case a.NodeKey > b.NodeKey:
+			return 1
+		default:
+			return 0
+		}
+	})
+	docs := make([]Doc, 0, len(keys))
+	for _, key := range keys {
+		docs = append(docs, newest[key])
 	}
 
 	old := s.segs
 	oldMetas := s.mf.Segments
+	if len(docs) == 0 {
+		s.segs = nil
+		s.mf.Segments = nil
+		if err := s.saveManifestLocked(); err != nil {
+			s.segs = old
+			s.mf.Segments = oldMetas
+			return nil, err
+		}
+		for _, seg := range old {
+			if seg.docs != nil {
+				_ = seg.docs.Close()
+			}
+			if seg.content != nil {
+				_ = seg.content.Close()
+			}
+			if seg.tri != nil {
+				seg.tri.Close()
+			}
+			_ = os.RemoveAll(seg.dir)
+		}
+		return map[DocKey]DocPos{}, nil
+	}
 	s.segs = nil
 	s.mf.Segments = nil
 	if err := s.addSegmentLocked(docs); err != nil {
@@ -112,9 +150,9 @@ func (s *Store) merge() (map[uint32]DocPos, error) {
 		return nil, err
 	}
 	newSegID := s.segs[len(s.segs)-1].meta.ID
-	locations := make(map[uint32]DocPos, len(docs))
+	locations := make(map[DocKey]DocPos, len(docs))
 	for i := range docs {
-		locations[docs[i].NodeID] = DocPos{SegID: newSegID, Local: uint32(i)}
+		locations[docs[i].Key] = DocPos{SegID: newSegID, Local: uint32(i)}
 	}
 
 	for _, seg := range old {
@@ -141,10 +179,13 @@ func docForSeg(seg *storeSegment, local uint32) (DocRecord, bool) {
 		return DocRecord{}, false
 	}
 	return DocRecord{
-		NodeID: uint32le(rec[0:4]),
-		Gen:    uint32le(rec[4:8]),
-		MTime:  int64(uint64le(rec[8:16])),
-		Off:    uint64le(rec[16:24]),
+		Key: DocKey{
+			VolID:   binary.LittleEndian.Uint16(rec[0:2]),
+			NodeKey: uint64le(rec[4:12]),
+		},
+		Gen:   uint32le(rec[12:16]),
+		MTime: int64(uint64le(rec[16:24])),
+		Off:   uint64le(rec[24:32]),
 	}, true
 }
 

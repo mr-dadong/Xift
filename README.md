@@ -277,7 +277,7 @@ full-text index of UTF-8 text/code (≤ 4 MiB per file, trigram postings plus ex
 substring verification):
 
 ```bash
-xift l2 add ~/code          # whitelist a directory; a daemon started with L2 enabled indexes it in the background
+xift l2 add ~/code          # whitelist a directory; a running daemon scans and indexes it right away
 xift l2 status --json       # roots, indexed docs, skip counters, disk usage/cap, paused
 xift l2 remove ~/code
 xift 'content:"mutex" ext:go'   # body filter ANDed with all L1 conditions
@@ -286,6 +286,8 @@ xift 'content:"mutex" ext:go'   # body filter ANDed with all L1 conditions
 - `content:` returns file-level rows only — no line numbers, snippets or body highlights.
 - Folded/excluded paths (`node_modules`, `.git`, build output) are skipped exactly as in L1.
 - Changes become visible within 60 s (3 s debounce); indexing never blocks L1 queries.
+- The daemon builds the first index from its own L1 scan; no host-side path resolver is needed.
+- An index written by an older version is renamed to `l2.v1.bak` on open and rebuilt from scratch.
 - Without a whitelist or with L2 disabled, a `content:` query returns an empty result **plus a warning** instead of silently ignoring the filter.
 - Budgets: 16 MiB L2 block cache (independent of L1), 4 GiB content-index disk cap (ingestion pauses at the cap), 4 MiB per file.
 

@@ -2,6 +2,7 @@ package l2search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -23,9 +24,21 @@ type Excluder interface {
 	Excluded(path string, isDir bool) bool
 }
 
-// Resolver maps a filesystem path to its L1 node identity.
-type Resolver interface {
-	Resolve(path string) (nodeID uint32, mtime int64, ok bool)
+// ScanRecord is one node emitted by the L1 subtree scan. Directory records are
+// guaranteed to precede their children.
+type ScanRecord struct {
+	VolID     uint16
+	NodeKey   uint64
+	ParentKey uint64
+	Name      string
+	IsDir     bool
+	ModTime   int64
+}
+
+// SubtreeScanner streams a read-only subtree scan rooted at root. The first
+// record MUST be the root directory itself (ParentKey == NodeKey).
+type SubtreeScanner interface {
+	ScanSubtreeWithRoot(ctx context.Context, root string, fn func(ScanRecord) error) error
 }
 
 // WSOptions configures the L2 workspace.
@@ -34,7 +47,7 @@ type WSOptions struct {
 	DiskCapBytes int64
 	Debounce     time.Duration
 	BatchDocs    int
-	Resolver     Resolver
+	Scanner      SubtreeScanner
 	Excluder     Excluder
 }
 
@@ -55,6 +68,12 @@ type docRef struct {
 	local uint32
 }
 
+type pendingOp struct {
+	path  string
+	mtime int64
+	index bool
+}
+
 // Workspace owns the whitelist, the debounce queue and the write path into the
 // L2 store. It never writes user files: only reads them and appends to the
 // content index.
@@ -70,8 +89,9 @@ type Workspace struct {
 	mergeMu   sync.Mutex
 	mu        sync.Mutex
 	roots     []string
-	refs      map[string]docRef
-	pending   map[string]bool // true = index, false = delete
+	refs      map[DocKey]docRef
+	paths     map[DocKey]string
+	pending   map[DocKey]pendingOp
 	lastEvent time.Time
 	stats     Stats
 	started   bool
@@ -94,8 +114,9 @@ func NewWorkspace(store *Store, opts WSOptions) *Workspace {
 		store:   store,
 		opts:    opts,
 		now:     time.Now,
-		refs:    make(map[string]docRef),
-		pending: make(map[string]bool),
+		refs:    make(map[DocKey]docRef),
+		paths:   make(map[DocKey]string),
+		pending: make(map[DocKey]pendingOp),
 		stats:   Stats{Skipped: make(map[SkipReason]int)},
 	}
 }
@@ -124,15 +145,14 @@ func (w *Workspace) RemoveRoot(root string) []string {
 	w.mu.Lock()
 	w.roots = slices.DeleteFunc(w.roots, func(p string) bool { return p == abs })
 	var dead []docRef
-	for p, ref := range w.refs {
-		if pathWithin(p, abs) {
-			delete(w.refs, p)
-			dead = append(dead, ref)
-		}
-	}
-	for p := range w.pending {
-		if pathWithin(p, abs) {
-			delete(w.pending, p)
+	for key, path := range w.paths {
+		if pathWithin(path, abs) {
+			if ref, ok := w.refs[key]; ok {
+				dead = append(dead, ref)
+			}
+			delete(w.refs, key)
+			delete(w.paths, key)
+			delete(w.pending, key)
 		}
 	}
 	roots := slices.Clone(w.roots)
@@ -180,18 +200,14 @@ func pathWithin(path, root string) bool {
 	return c == '/' || c == '\\'
 }
 
-// Enqueue schedules path for reindexing after the debounce window.
-func (w *Workspace) Enqueue(path string) {
+// EnqueueEvent schedules key at path for reindexing after the debounce window.
+// index=false records a deletion of that key.
+func (w *Workspace) EnqueueEvent(key DocKey, path string, mtime int64, index bool) {
 	w.mu.Lock()
-	w.pending[path] = true
-	w.lastEvent = w.now()
-	w.mu.Unlock()
-}
-
-// EnqueueDelete schedules path for removal after the debounce window.
-func (w *Workspace) EnqueueDelete(path string) {
-	w.mu.Lock()
-	w.pending[path] = false
+	w.pending[key] = pendingOp{path: path, mtime: mtime, index: index}
+	if index {
+		w.paths[key] = path
+	}
 	w.lastEvent = w.now()
 	w.mu.Unlock()
 }
@@ -244,16 +260,11 @@ func (w *Workspace) flushIfDue(ctx context.Context) {
 		return
 	}
 	pending := w.pending
-	w.pending = make(map[string]bool)
+	w.pending = make(map[DocKey]pendingOp)
 	w.mu.Unlock()
 
-	paths := make([]string, 0, len(pending))
-	for p := range pending {
-		paths = append(paths, p)
-	}
-	slices.Sort(paths)
 	w.mergeMu.Lock()
-	w.applyBatch(ctx, paths, pending)
+	w.applyBatch(ctx, pending)
 	w.mergeMu.Unlock()
 	w.persistStats()
 	w.maybeMerge()
@@ -262,10 +273,32 @@ func (w *Workspace) flushIfDue(ctx context.Context) {
 	}
 }
 
-// applyBatch indexes/deletes the given paths, then flushes new documents as one
-// or more segments.
-func (w *Workspace) applyBatch(ctx context.Context, paths []string, ops map[string]bool) {
+// applyBatch indexes/deletes the queued keys, flushing new documents as one or
+// more segments. Callers hold mergeMu.
+func (w *Workspace) applyBatch(ctx context.Context, ops map[DocKey]pendingOp) {
+	keys := make([]DocKey, 0, len(ops))
+	for key := range ops {
+		keys = append(keys, key)
+	}
+	slices.SortFunc(keys, func(a, b DocKey) int {
+		if a.VolID != b.VolID {
+			if a.VolID < b.VolID {
+				return -1
+			}
+			return 1
+		}
+		switch {
+		case a.NodeKey < b.NodeKey:
+			return -1
+		case a.NodeKey > b.NodeKey:
+			return 1
+		default:
+			return 0
+		}
+	})
+
 	var docs []Doc
+	var docKeys []DocKey
 	var docPaths []string
 	flush := func() {
 		if len(docs) == 0 {
@@ -277,50 +310,51 @@ func (w *Workspace) applyBatch(ctx context.Context, paths []string, ops map[stri
 			w.stats.Skipped[SkipReadError] += len(docs)
 			w.mu.Unlock()
 			docs = docs[:0]
+			docKeys = docKeys[:0]
 			docPaths = docPaths[:0]
 			return
 		}
 		w.mu.Lock()
-		for i, p := range docPaths {
-			w.refs[p] = docRef{segID: segID, local: uint32(i)}
+		for i, key := range docKeys {
+			w.refs[key] = docRef{segID: segID, local: uint32(i)}
+			w.paths[key] = docPaths[i]
 		}
 		w.stats.Batches++
 		w.mu.Unlock()
 		docs = docs[:0]
+		docKeys = docKeys[:0]
 		docPaths = docPaths[:0]
 	}
 
-	for _, path := range paths {
-		if err := ctx.Err(); err != nil {
+	for _, key := range keys {
+		if ctx.Err() != nil {
 			break
 		}
-		if !w.InRoot(path) || w.excluded(path, false) {
+		op := ops[key]
+		if !op.index {
+			w.markDeleted(key)
 			continue
 		}
-		if !ops[path] {
-			w.markDeleted(path)
+		if !w.InRoot(op.path) || w.excluded(op.path, false) {
 			continue
 		}
-		text, reason, err := ReadTextFile(path, w.opts.MaxFileBytes)
+		text, reason, err := ReadTextFile(op.path, w.opts.MaxFileBytes)
 		if err != nil || reason != SkipNone {
 			w.mu.Lock()
 			w.stats.Skipped[reason]++
 			w.mu.Unlock()
 			continue
 		}
-		nodeID, mtime, ok := uint32(0), int64(0), true
-		if w.opts.Resolver != nil {
-			nodeID, mtime, ok = w.opts.Resolver.Resolve(path)
+		mtime := op.mtime
+		if mtime == 0 {
+			if info, serr := os.Stat(op.path); serr == nil {
+				mtime = info.ModTime().UnixNano()
+			}
 		}
-		if !ok {
-			w.mu.Lock()
-			w.stats.Skipped[SkipReadError]++
-			w.mu.Unlock()
-			continue
-		}
-		w.markDeleted(path)
-		docs = append(docs, Doc{NodeID: nodeID, MTime: mtime, Text: text})
-		docPaths = append(docPaths, path)
+		w.markDeleted(key)
+		docs = append(docs, Doc{Key: key, MTime: mtime, Text: text})
+		docKeys = append(docKeys, key)
+		docPaths = append(docPaths, op.path)
 		w.mu.Lock()
 		w.stats.Indexed++
 		w.mu.Unlock()
@@ -335,11 +369,11 @@ func (w *Workspace) excluded(path string, isDir bool) bool {
 	return w.opts.Excluder != nil && w.opts.Excluder.Excluded(path, isDir)
 }
 
-func (w *Workspace) markDeleted(path string) {
+func (w *Workspace) markDeleted(key DocKey) {
 	w.mu.Lock()
-	ref, ok := w.refs[path]
+	ref, ok := w.refs[key]
 	if ok {
-		delete(w.refs, path)
+		delete(w.refs, key)
 		w.stats.Deleted++
 	}
 	w.mu.Unlock()
@@ -348,36 +382,42 @@ func (w *Workspace) markDeleted(path string) {
 	}
 }
 
-// IndexRoot walks root and indexes every eligible file under the context.
-// Index writes and the trailing compaction are serialized by mergeMu.
-func (w *Workspace) IndexRoot(ctx context.Context, root string) error {
+var errRootRemoved = errors.New("l2search: root removed during scan")
+
+// IndexScan walks root through the L1 subtree scanner and indexes every
+// eligible file. Paths are composed from parent keys; the scanner's root
+// record seeds the table. Index writes and the trailing compaction are
+// serialized by mergeMu.
+func (w *Workspace) IndexScan(ctx context.Context, root string) error {
+	if w.opts.Scanner == nil {
+		return errors.New("l2search: no subtree scanner configured")
+	}
 	w.mergeMu.Lock()
-	err := w.indexRootLocked(ctx, root)
+	err := w.indexScanLocked(ctx, root)
 	w.mergeMu.Unlock()
 	w.maybeMerge()
 	return err
 }
 
-func (w *Workspace) indexRootLocked(ctx context.Context, root string) error {
+func (w *Workspace) indexScanLocked(ctx context.Context, root string) error {
 	defer w.persistStats()
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return fmt.Errorf("l2search: resolve root: %w", err)
 	}
-	if info, err := os.Stat(abs); err != nil || !info.IsDir() {
-		return fmt.Errorf("l2search: %s is not a directory", abs)
-	}
+	dirPaths := make(map[uint64]string)
+
 	var docs []Doc
-	var paths []string
+	var docKeys []DocKey
+	var docPaths []string
 	flush := func() error {
 		if len(docs) == 0 {
 			return nil
 		}
 		if !w.InRoot(abs) {
-			// The root was removed while this pass was walking; drop the batch
-			// instead of re-adding documents the removal just purged.
 			docs = docs[:0]
-			paths = paths[:0]
+			docKeys = docKeys[:0]
+			docPaths = docPaths[:0]
 			return nil
 		}
 		segID, err := w.store.AddSegmentID(docs)
@@ -385,51 +425,60 @@ func (w *Workspace) indexRootLocked(ctx context.Context, root string) error {
 			return err
 		}
 		w.mu.Lock()
-		for i, p := range paths {
-			w.refs[p] = docRef{segID: segID, local: uint32(i)}
+		for i, key := range docKeys {
+			w.refs[key] = docRef{segID: segID, local: uint32(i)}
+			w.paths[key] = docPaths[i]
 		}
 		w.stats.Batches++
 		w.mu.Unlock()
 		docs = docs[:0]
-		paths = paths[:0]
+		docKeys = docKeys[:0]
+		docPaths = docPaths[:0]
 		return nil
 	}
+	skip := func(reason SkipReason) {
+		w.mu.Lock()
+		w.stats.Skipped[reason]++
+		w.mu.Unlock()
+	}
 
-	walkErr := filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil // unreadable entries are skipped, not fatal
+	scanErr := w.opts.Scanner.ScanSubtreeWithRoot(ctx, abs, func(rec ScanRecord) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if serr := ctx.Err(); serr != nil {
-			return serr
+		if !w.InRoot(abs) {
+			return errRootRemoved
 		}
-		if d.IsDir() {
-			if path != abs && w.excluded(path, true) {
-				return fs.SkipDir
+		key := DocKey{VolID: rec.VolID, NodeKey: rec.NodeKey}
+		if rec.IsDir {
+			if rec.ParentKey == rec.NodeKey {
+				dirPaths[rec.NodeKey] = abs
+				return nil
 			}
+			parent := dirPaths[rec.ParentKey]
+			if parent == "" {
+				return nil
+			}
+			dirPaths[rec.NodeKey] = filepath.Join(parent, rec.Name)
 			return nil
 		}
+		parent := dirPaths[rec.ParentKey]
+		if parent == "" {
+			skip(SkipNoPath)
+			return nil
+		}
+		path := filepath.Join(parent, rec.Name)
 		if w.excluded(path, false) {
 			return nil
 		}
 		text, reason, rerr := ReadTextFile(path, w.opts.MaxFileBytes)
 		if rerr != nil || reason != SkipNone {
-			w.mu.Lock()
-			w.stats.Skipped[reason]++
-			w.mu.Unlock()
+			skip(reason)
 			return nil
 		}
-		nodeID, mtime, ok := uint32(0), int64(0), true
-		if w.opts.Resolver != nil {
-			nodeID, mtime, ok = w.opts.Resolver.Resolve(path)
-		}
-		if !ok {
-			w.mu.Lock()
-			w.stats.Skipped[SkipReadError]++
-			w.mu.Unlock()
-			return nil
-		}
-		docs = append(docs, Doc{NodeID: nodeID, MTime: mtime, Text: text})
-		paths = append(paths, path)
+		docs = append(docs, Doc{Key: key, MTime: rec.ModTime, Text: text})
+		docKeys = append(docKeys, key)
+		docPaths = append(docPaths, path)
 		w.mu.Lock()
 		w.stats.Indexed++
 		w.mu.Unlock()
@@ -438,9 +487,9 @@ func (w *Workspace) indexRootLocked(ctx context.Context, root string) error {
 		}
 		return nil
 	})
-	if walkErr != nil {
-		_ = flush() // keep documents indexed before cancellation
-		return walkErr
+	if scanErr != nil {
+		_ = flush()
+		return scanErr
 	}
 	return flush()
 }
@@ -462,12 +511,12 @@ func (w *Workspace) Stats() Stats {
 }
 
 // Search exposes the store's content lookup to the query layer.
-func (w *Workspace) Search(term []byte, budget int) ([]uint32, bool, error) {
+func (w *Workspace) Search(term []byte, budget int) ([]DocKey, bool, error) {
 	return w.store.Search(term, budget)
 }
 
 // maybeMerge compacts segments once the count or dead ratio crosses the
-// thresholds, then rewrites per-path references to the merged segment.
+// thresholds, then rewrites document references to the merged segment.
 func (w *Workspace) maybeMerge() {
 	w.mergeMu.Lock()
 	defer w.mergeMu.Unlock()
@@ -475,33 +524,23 @@ func (w *Workspace) maybeMerge() {
 		return
 	}
 	w.mu.Lock()
-	paths := make([]string, 0, len(w.refs))
-	refs := make([]docRef, 0, len(w.refs))
-	for p, ref := range w.refs {
-		paths = append(paths, p)
-		refs = append(refs, ref)
+	keys := make([]DocKey, 0, len(w.refs))
+	for key := range w.refs {
+		keys = append(keys, key)
 	}
 	w.mu.Unlock()
 
-	nodeIDs := make([]uint32, len(refs))
-	for i, ref := range refs {
-		if id, ok := w.store.DocNodeID(ref.segID, ref.local); ok {
-			nodeIDs[i] = id
-		}
-	}
 	locations, err := w.store.MergeWithLocations()
 	if err != nil {
 		return
 	}
 	w.mu.Lock()
-	for i, p := range paths {
-		if nodeIDs[i] == 0 {
-			continue
-		}
-		if loc, ok := locations[nodeIDs[i]]; ok {
-			w.refs[p] = docRef{segID: loc.SegID, local: loc.Local}
+	for _, key := range keys {
+		if loc, ok := locations[key]; ok {
+			w.refs[key] = docRef{segID: loc.SegID, local: loc.Local}
 		} else {
-			delete(w.refs, p)
+			delete(w.refs, key)
+			delete(w.paths, key)
 		}
 	}
 	w.mu.Unlock()
@@ -513,4 +552,99 @@ func (w *Workspace) persistStats() {
 	w.persistMu.Lock()
 	defer w.persistMu.Unlock()
 	_ = SaveStats(w.store.Dir(), statsToDisk(w.Stats()))
+}
+
+// IndexRoot indexes a root by walking the local filesystem. It exists for tests
+// and callers without an L1 scanner; production indexing uses IndexScan so
+// document keys match L1.
+func (w *Workspace) IndexRoot(ctx context.Context, root string) error {
+	w.mergeMu.Lock()
+	err := w.indexRootLocked(ctx, root)
+	w.mergeMu.Unlock()
+	w.maybeMerge()
+	return err
+}
+
+func (w *Workspace) indexRootLocked(ctx context.Context, root string) error {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Errorf("l2search: resolve root: %w", err)
+	}
+	if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+		return fmt.Errorf("l2search: %s is not a directory", abs)
+	}
+	var docs []Doc
+	var paths []string
+	flush := func() error {
+		if len(docs) == 0 {
+			return nil
+		}
+		segID, err := w.store.AddSegmentID(docs)
+		if err != nil {
+			return err
+		}
+		w.mu.Lock()
+		for i := range paths {
+			key := docs[i].Key
+			w.refs[key] = docRef{segID: segID, local: uint32(i)}
+			w.paths[key] = paths[i]
+		}
+		w.stats.Batches++
+		w.mu.Unlock()
+		docs = docs[:0]
+		paths = paths[:0]
+		return nil
+	}
+	walkErr := filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if serr := ctx.Err(); serr != nil {
+			return serr
+		}
+		if d.IsDir() {
+			if path != abs && w.excluded(path, true) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if w.excluded(path, false) {
+			return nil
+		}
+		text, reason, rerr := ReadTextFile(path, w.opts.MaxFileBytes)
+		if rerr != nil || reason != SkipNone {
+			w.mu.Lock()
+			w.stats.Skipped[reason]++
+			w.mu.Unlock()
+			return nil
+		}
+		var mtime int64
+		if info, ierr := d.Info(); ierr == nil {
+			mtime = info.ModTime().UnixNano()
+		}
+		key := DocKey{VolID: 1, NodeKey: stablePathKey(path)}
+		docs = append(docs, Doc{Key: key, MTime: mtime, Text: text})
+		paths = append(paths, path)
+		w.mu.Lock()
+		w.stats.Indexed++
+		w.mu.Unlock()
+		if len(docs) >= w.opts.BatchDocs {
+			return flush()
+		}
+		return nil
+	})
+	if walkErr != nil {
+		_ = flush()
+		return walkErr
+	}
+	return flush()
+}
+
+func stablePathKey(path string) uint64 {
+	var h uint64 = 1469598103934665603
+	for i := 0; i < len(path); i++ {
+		h ^= uint64(path[i])
+		h *= 1099511628211
+	}
+	return h
 }

@@ -13,6 +13,7 @@ import (
 
 	"github.com/mr-dadong/Xift/internal/l2search"
 	"github.com/mr-dadong/Xift/internal/provider"
+	"github.com/mr-dadong/Xift/internal/storage"
 	"github.com/mr-dadong/Xift/internal/storage/lsm"
 )
 
@@ -24,9 +25,9 @@ type L2Config struct {
 	// Roots are whitelisted directories indexed at startup. Roots persisted by
 	// earlier `l2 add` calls are restored as well.
 	Roots []string
-	// Resolver maps a file path to its L1 node identity. It is required: without
-	// it the L2 index cannot name the L1 rows that content hits refer to.
-	Resolver l2search.Resolver
+	// Scanner drives the initial index from the L1 subtree scan so document
+	// keys match L1 exactly. It is required.
+	Scanner l2search.SubtreeScanner
 	// Excluder mirrors L1 pruning (HardExclude / Fold) for whitelisted trees.
 	Excluder     l2search.Excluder
 	MaxFileBytes int64
@@ -42,6 +43,7 @@ type L2Config struct {
 // unaffected.
 type L2Pipeline struct {
 	store    *l2search.Store
+	engine   *storage.Engine
 	cache    *lsm.BlockCache
 	ws       *l2search.Workspace
 	volRoots map[uint16]string
@@ -59,9 +61,12 @@ type L2Pipeline struct {
 // OpenL2Pipeline opens the content index under dataDir/l2, restores the
 // persisted whitelist and starts the background worker. Whitelisted roots begin
 // indexing in the background; OpenL2Pipeline itself does not read user files.
-func OpenL2Pipeline(parent context.Context, dataDir string, cfg L2Config) (*L2Pipeline, error) {
-	if cfg.Resolver == nil {
-		return nil, errors.New("daemon: L2 content index requires an L1 path resolver")
+func OpenL2Pipeline(parent context.Context, dataDir string, engine *storage.Engine, cfg L2Config) (*L2Pipeline, error) {
+	if cfg.Scanner == nil {
+		return nil, errors.New("daemon: L2 content index requires an L1 subtree scanner")
+	}
+	if engine == nil {
+		return nil, errors.New("daemon: L2 content index requires the storage engine")
 	}
 	cacheBytes := cfg.CacheBytes
 	if cacheBytes <= 0 {
@@ -81,12 +86,13 @@ func OpenL2Pipeline(parent context.Context, dataDir string, cfg L2Config) (*L2Pi
 		DiskCapBytes: cfg.DiskCapBytes,
 		Debounce:     cfg.Debounce,
 		BatchDocs:    cfg.BatchDocs,
-		Resolver:     cfg.Resolver,
+		Scanner:      cfg.Scanner,
 		Excluder:     cfg.Excluder,
 	})
 	ctx, cancel := context.WithCancel(parent)
 	p := &L2Pipeline{
 		store:    st,
+		engine:   engine,
 		cache:    cache,
 		ws:       ws,
 		volRoots: cfg.VolRoots,
@@ -175,6 +181,19 @@ func (p *L2Pipeline) Status() l2search.Stats {
 // Search returns the L1 node IDs whose content contains term. The second
 // result reports whether the result set was truncated by budget.
 func (p *L2Pipeline) Search(term []byte, budget int) ([]uint32, bool, error) {
+	keys, truncated, err := p.ws.Search(term, budget)
+	if err != nil {
+		return nil, false, err
+	}
+	refs := make([]storage.NodeKeyRef, len(keys))
+	for i, key := range keys {
+		refs[i] = storage.NodeKeyRef{VolID: key.VolID, NodeKey: key.NodeKey}
+	}
+	return p.engine.LookupLiveNodeIDs(refs), truncated, nil
+}
+
+// searchKeys exposes raw document keys for tests that do not seed L1 rows.
+func (p *L2Pipeline) searchKeys(term []byte, budget int) ([]l2search.DocKey, bool, error) {
 	return p.ws.Search(term, budget)
 }
 
@@ -197,37 +216,33 @@ func (p *L2Pipeline) handleEvent(ev provider.FileEvent) {
 		return
 	case provider.EventDelete:
 		if path, ok := p.deletedPath(ev); ok {
-			p.enqueue(false, path)
+			p.enqueue(false, path, ev)
 		} else {
 			p.skippedEvents.Add(1)
 		}
 	case provider.EventRename:
-		if path, ok := p.deletedPath(ev); ok {
-			p.enqueue(false, path)
-		}
+		// Renames keep the filesystem key, so the document identity (and its
+		// content hit) survives; only the tracked path changes.
 		if path, ok := p.currentPath(ev); ok {
-			p.enqueue(true, path)
+			p.enqueue(true, path, ev)
 		} else {
 			p.skippedEvents.Add(1)
 		}
 	default: // create, modify
 		if path, ok := p.currentPath(ev); ok {
-			p.enqueue(true, path)
+			p.enqueue(true, path, ev)
 		} else {
 			p.skippedEvents.Add(1)
 		}
 	}
 }
 
-func (p *L2Pipeline) enqueue(index bool, path string) {
-	if !p.ws.InRoot(path) {
+func (p *L2Pipeline) enqueue(index bool, path string, ev provider.FileEvent) {
+	if ev.NodeKey == 0 || !p.ws.InRoot(path) {
+		p.skippedEvents.Add(1)
 		return
 	}
-	if index {
-		p.ws.Enqueue(path)
-		return
-	}
-	p.ws.EnqueueDelete(path)
+	p.ws.EnqueueEvent(l2search.DocKey{VolID: ev.VolID, NodeKey: ev.NodeKey}, path, ev.ModTime, index)
 }
 
 // currentPath resolves the post-event path of ev.
@@ -275,7 +290,7 @@ func (p *L2Pipeline) scheduleIndex(root string) {
 			p.mu.Unlock()
 		}()
 		runtime.Gosched()
-		if err := p.ws.IndexRoot(p.ctx, root); err != nil && !errors.Is(err, context.Canceled) {
+		if err := p.ws.IndexScan(p.ctx, root); err != nil && !errors.Is(err, context.Canceled) {
 			p.indexErrors.Add(1)
 		}
 	}()

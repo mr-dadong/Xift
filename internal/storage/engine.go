@@ -1619,6 +1619,7 @@ func (e *Engine) AcquireSnapshot() *Snapshot {
 	e.memShared.Store(true)
 	return &Snapshot{
 		segs:      segs,
+		l1Segs:    len(e.segments),
 		snapshots: ranges,
 		mem:       e.mem,
 		gen:       e.writeGen,
@@ -1767,7 +1768,10 @@ func (e *Engine) Close() error {
 
 // Snapshot provides lock-free, race-free, point-in-time isolated read access to segments and MemTable.
 type Snapshot struct {
-	segs      []snapSegment
+	segs []snapSegment
+	// l1Segs is the count of live L1 segments at the front of segs; the rest
+	// are mounted read-only snapshot packages.
+	l1Segs    int
 	snapshots []snapshotRange
 	mem       *MemTable
 	gen       uint64

@@ -93,14 +93,14 @@ func (s *Store) Content(segIdx int, local uint32) ([]byte, bool) {
 	if _, err := seg.docs.ReadAt(rec[:], int64(local)*docRecordSize); err != nil {
 		return nil, false
 	}
-	off := binary.LittleEndian.Uint64(rec[16:24])
+	off := binary.LittleEndian.Uint64(rec[24:32])
 	next := uint64(0)
 	if local+1 < seg.meta.Docs {
 		var nrec [docRecordSize]byte
 		if _, err := seg.docs.ReadAt(nrec[:], int64(local+1)*docRecordSize); err != nil {
 			return nil, false
 		}
-		next = binary.LittleEndian.Uint64(nrec[16:24])
+		next = binary.LittleEndian.Uint64(nrec[24:32])
 	} else {
 		info, err := seg.content.Stat()
 		if err != nil {
@@ -121,7 +121,7 @@ func (s *Store) Content(segIdx int, local uint32) ([]byte, bool) {
 // Search returns the live node IDs whose content contains term (exact
 // substring, case-folded ASCII). truncated reports that the candidate budget
 // stopped the scan early.
-func (s *Store) Search(term []byte, budget int) ([]uint32, bool, error) {
+func (s *Store) Search(term []byte, budget int) ([]DocKey, bool, error) {
 	if len(term) == 0 {
 		return nil, false, nil
 	}
@@ -133,8 +133,8 @@ func (s *Store) Search(term []byte, budget int) ([]uint32, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	newest := make(map[uint32]uint32) // nodeID -> gen
-	matched := make(map[uint32]struct{})
+	newest := make(map[DocKey]uint32) // doc key -> gen
+	matched := make(map[DocKey]struct{})
 	verified := 0
 	for si := range s.segs {
 		seg := s.segs[si]
@@ -166,9 +166,9 @@ func (s *Store) Search(term []byte, budget int) ([]uint32, bool, error) {
 			if !ok {
 				return true
 			}
-			if prev, seen := newest[rec.NodeID]; !seen || rec.Gen >= prev {
-				newest[rec.NodeID] = rec.Gen
-				matched[rec.NodeID] = struct{}{}
+			if prev, seen := newest[rec.Key]; !seen || rec.Gen >= prev {
+				newest[rec.Key] = rec.Gen
+				matched[rec.Key] = struct{}{}
 			}
 			if budget > 0 && verified >= budget {
 				stop = true
@@ -177,10 +177,10 @@ func (s *Store) Search(term []byte, budget int) ([]uint32, bool, error) {
 			return true
 		})
 		if stop {
-			return sortedNodeIDs(matched), true, nil
+			return sortedDocKeys(matched), true, nil
 		}
 	}
-	return sortedNodeIDs(matched), false, nil
+	return sortedDocKeys(matched), false, nil
 }
 
 func (s *Store) contentLocked(segIdx int, local uint32) ([]byte, bool) {
@@ -192,14 +192,14 @@ func (s *Store) contentLocked(segIdx int, local uint32) ([]byte, bool) {
 	if _, err := seg.docs.ReadAt(rec[:], int64(local)*docRecordSize); err != nil {
 		return nil, false
 	}
-	off := binary.LittleEndian.Uint64(rec[16:24])
+	off := binary.LittleEndian.Uint64(rec[24:32])
 	next := uint64(0)
 	if local+1 < seg.meta.Docs {
 		var nrec [docRecordSize]byte
 		if _, err := seg.docs.ReadAt(nrec[:], int64(local+1)*docRecordSize); err != nil {
 			return nil, false
 		}
-		next = binary.LittleEndian.Uint64(nrec[16:24])
+		next = binary.LittleEndian.Uint64(nrec[24:32])
 	} else {
 		info, err := seg.content.Stat()
 		if err != nil {
@@ -227,9 +227,12 @@ func (s *Store) docLocked(segIdx int, local uint32) (DocRecord, bool) {
 		return DocRecord{}, false
 	}
 	return DocRecord{
-		NodeID: binary.LittleEndian.Uint32(rec[0:4]),
-		Gen:    binary.LittleEndian.Uint32(rec[4:8]),
-		MTime:  int64(binary.LittleEndian.Uint64(rec[8:16])),
+		Key: DocKey{
+			VolID:   binary.LittleEndian.Uint16(rec[0:2]),
+			NodeKey: binary.LittleEndian.Uint64(rec[4:12]),
+		},
+		Gen:   binary.LittleEndian.Uint32(rec[12:16]),
+		MTime: int64(binary.LittleEndian.Uint64(rec[16:24])),
 	}, true
 }
 
@@ -269,12 +272,27 @@ func loadSegmentPostings(tri *lsm.InvertedIndex, segID uint32, grams []uint64) (
 	return views, true, nil
 }
 
-func sortedNodeIDs(set map[uint32]struct{}) []uint32 {
-	out := make([]uint32, 0, len(set))
-	for id := range set {
-		out = append(out, id)
+func sortedDocKeys(set map[DocKey]struct{}) []DocKey {
+	out := make([]DocKey, 0, len(set))
+	for key := range set {
+		out = append(out, key)
 	}
-	slices.Sort(out)
+	slices.SortFunc(out, func(a, b DocKey) int {
+		if a.VolID != b.VolID {
+			if a.VolID < b.VolID {
+				return -1
+			}
+			return 1
+		}
+		switch {
+		case a.NodeKey < b.NodeKey:
+			return -1
+		case a.NodeKey > b.NodeKey:
+			return 1
+		default:
+			return 0
+		}
+	})
 	return out
 }
 

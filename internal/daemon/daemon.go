@@ -56,7 +56,7 @@ func Run(ctx context.Context, cfg Config) error {
 	var l2p *L2Pipeline
 	if cfg.L2 != nil {
 		var err error
-		l2p, err = OpenL2Pipeline(ctx, dataDir, *cfg.L2)
+		l2p, err = OpenL2Pipeline(ctx, dataDir, store, *cfg.L2)
 		if err != nil {
 			_ = ln.Close()
 			return err

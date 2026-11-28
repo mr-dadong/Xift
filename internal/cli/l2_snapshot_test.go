@@ -175,8 +175,8 @@ func TestL2StatusJSON(t *testing.T) {
 		t.Fatalf("OpenStore: %v", err)
 	}
 	if err := st.AddSegment([]l2search.Doc{
-		{NodeID: 1, Text: []byte("alpha mutex")},
-		{NodeID: 2, Text: []byte("beta mutex")},
+		{Key: l2search.DocKey{VolID: 1, NodeKey: 1}, Text: []byte("alpha mutex")},
+		{Key: l2search.DocKey{VolID: 1, NodeKey: 2}, Text: []byte("beta mutex")},
 	}); err != nil {
 		t.Fatalf("AddSegment: %v", err)
 	}

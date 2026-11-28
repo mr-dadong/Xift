@@ -6,36 +6,67 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"testing"
 	"time"
 
+	"github.com/mr-dadong/Xift/internal/l2search"
 	"github.com/mr-dadong/Xift/internal/provider"
 	"github.com/mr-dadong/Xift/internal/query"
 	"github.com/mr-dadong/Xift/internal/storage"
 )
 
-// pathIDResolver assigns deterministic L1-style node IDs per path.
-type pathIDResolver struct {
-	mu   sync.Mutex
-	next uint32
-	ids  map[string]uint32
-}
-
-func newPathIDResolver() *pathIDResolver {
-	return &pathIDResolver{ids: make(map[string]uint32)}
-}
-
-func (r *pathIDResolver) Resolve(path string) (uint32, int64, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	id, ok := r.ids[path]
-	if !ok {
-		r.next++
-		id = r.next
-		r.ids[path] = id
+// treeKey derives a deterministic filesystem key from a path for tests.
+func treeKey(path string) uint64 {
+	var h uint64 = 1469598103934665603
+	for i := 0; i < len(path); i++ {
+		h ^= uint64(path[i])
+		h *= 1099511628211
 	}
-	return id, 0, true
+	return h
+}
+
+// treeScanner emits a root record followed by the real directory tree.
+type treeScanner struct{ prefix string }
+
+func (s treeScanner) ScanSubtreeWithRoot(ctx context.Context, root string, fn func(l2search.ScanRecord) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := fn(l2search.ScanRecord{
+		VolID: 1, NodeKey: treeKey(root), ParentKey: treeKey(root), Name: filepath.Base(root), IsDir: true,
+	}); err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || path == root {
+			return nil
+		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return fn(l2search.ScanRecord{
+			VolID:     1,
+			NodeKey:   treeKey(path),
+			ParentKey: treeKey(filepath.Dir(path)),
+			Name:      d.Name(),
+			IsDir:     d.IsDir(),
+		})
+	})
+}
+
+// fixedScanner replays fixed records.
+type fixedScanner struct{ recs []l2search.ScanRecord }
+
+func (s fixedScanner) ScanSubtreeWithRoot(ctx context.Context, _ string, fn func(l2search.ScanRecord) error) error {
+	for _, rec := range s.recs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func writeL2File(t *testing.T, path, content string) {
@@ -95,9 +126,9 @@ func TestL2PipelineDoesNotBlockQueries(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	p, err := OpenL2Pipeline(ctx, dataDir, L2Config{
+	p, err := OpenL2Pipeline(ctx, dataDir, store, L2Config{
 		VolRoots:  map[uint16]string{1: contentRoot},
-		Resolver:  newPathIDResolver(),
+		Scanner:   treeScanner{},
 		Debounce:  30 * time.Millisecond,
 		BatchDocs: 200,
 	})
@@ -114,10 +145,12 @@ func TestL2PipelineDoesNotBlockQueries(t *testing.T) {
 	batch := provider.EventBatch{Events: make([]provider.FileEvent, 0, files+2)}
 	for _, path := range paths {
 		batch.Events = append(batch.Events, provider.FileEvent{
-			VolID: 1, Type: provider.EventCreate, RelPath: l2Rel(contentRoot, path),
+			VolID: 1, Type: provider.EventCreate, NodeKey: treeKey(path), RelPath: l2Rel(contentRoot, path),
 		})
 	}
-	batch.Events = append(batch.Events, provider.FileEvent{VolID: 1, Type: provider.EventCreate, OldPath: outside})
+	batch.Events = append(batch.Events, provider.FileEvent{
+		VolID: 1, Type: provider.EventCreate, NodeKey: treeKey(outside), OldPath: outside,
+	})
 	start := time.Now()
 	p.HandleBatch(batch)
 	if enqueue := time.Since(start); enqueue > 250*time.Millisecond {
@@ -153,55 +186,62 @@ func TestL2PipelineDoesNotBlockQueries(t *testing.T) {
 	}
 
 	waitForL2(t, 30*time.Second, func() bool {
-		ids, _, serr := p.Search([]byte("pipeline needle"), 0)
-		return serr == nil && len(ids) >= files/2
+		keys, _, serr := p.searchKeys([]byte("pipeline needle"), 0)
+		return serr == nil && len(keys) >= files/2
 	})
 	if st := p.Status(); st.Indexed == 0 || st.DiskUsed == 0 {
 		t.Fatalf("stats = %+v, want indexed docs and disk usage", st)
 	}
 
 	// Events outside the whitelist must never reach the index.
-	if ids, _, _ := p.Search([]byte("outsideonly"), 0); len(ids) != 0 {
-		t.Fatalf("outside whitelist content was indexed: %v", ids)
+	if keys, _, _ := p.searchKeys([]byte("outsideonly"), 0); len(keys) != 0 {
+		t.Fatalf("outside whitelist content was indexed: %v", keys)
 	}
 
 	// Modify → visible, delete → invisible, both driven by routed events.
 	edited := paths[0]
 	writeL2File(t, edited, "secondversion token only in the edited file")
 	p.HandleBatch(provider.EventBatch{Events: []provider.FileEvent{{
-		VolID: 1, Type: provider.EventModifyMeta, RelPath: l2Rel(contentRoot, edited),
+		VolID: 1, Type: provider.EventModifyMeta, NodeKey: treeKey(edited), RelPath: l2Rel(contentRoot, edited),
 	}}})
 	waitForL2(t, 10*time.Second, func() bool {
-		ids, _, _ := p.Search([]byte("secondversion"), 0)
-		return len(ids) == 1
+		keys, _, _ := p.searchKeys([]byte("secondversion"), 0)
+		return len(keys) == 1
 	})
 
 	if err := os.Remove(edited); err != nil {
 		t.Fatal(err)
 	}
 	p.HandleBatch(provider.EventBatch{Events: []provider.FileEvent{{
-		VolID: 1, Type: provider.EventDelete, RelPath: l2Rel(contentRoot, edited),
+		VolID: 1, Type: provider.EventDelete, NodeKey: treeKey(edited), RelPath: l2Rel(contentRoot, edited),
 	}}})
 	waitForL2(t, 10*time.Second, func() bool {
-		ids, _, _ := p.Search([]byte("secondversion"), 0)
-		return len(ids) == 0
+		keys, _, _ := p.searchKeys([]byte("secondversion"), 0)
+		return len(keys) == 0
 	})
 
 	// Removing the root purges its documents immediately.
 	if _, err := p.RemoveRoot(contentRoot); err != nil {
 		t.Fatalf("RemoveRoot: %v", err)
 	}
-	if ids, _, _ := p.Search([]byte("pipeline needle"), 0); len(ids) != 0 {
-		t.Fatalf("root removal left %d content hits", len(ids))
+	if keys, _, _ := p.searchKeys([]byte("pipeline needle"), 0); len(keys) != 0 {
+		t.Fatalf("root removal left %d content hits", len(keys))
 	}
 }
 
-// TestL2PipelineRequiresResolver verifies the pipeline refuses to open without
-// an L1 path resolver instead of indexing anonymous documents.
-func TestL2PipelineRequiresResolver(t *testing.T) {
-	_, err := OpenL2Pipeline(context.Background(), t.TempDir(), L2Config{})
-	if err == nil {
-		t.Fatal("OpenL2Pipeline must fail without a resolver")
+// TestL2PipelineRequiresScanner verifies the pipeline refuses to open without
+// the scanner and engine it needs for key-accurate indexing.
+func TestL2PipelineRequiresScanner(t *testing.T) {
+	if _, err := OpenL2Pipeline(context.Background(), t.TempDir(), nil, L2Config{Scanner: treeScanner{}}); err == nil {
+		t.Fatal("OpenL2Pipeline must fail without a storage engine")
+	}
+	store, err := storage.Open(t.TempDir(), storage.Options{DisableWALSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := OpenL2Pipeline(context.Background(), t.TempDir(), store, L2Config{}); err == nil {
+		t.Fatal("OpenL2Pipeline must fail without a scanner")
 	}
 }
 
@@ -223,8 +263,8 @@ func TestDaemonRunStartsL2Pipeline(t *testing.T) {
 			DataDir:  dataDir,
 			Endpoint: ep,
 			L2: &L2Config{
-				Roots:    []string{contentRoot},
-				Resolver: newPathIDResolver(),
+				Roots:   []string{contentRoot},
+				Scanner: treeScanner{},
 			},
 			OnL2Ready: func(p *L2Pipeline) { ready <- p },
 		})
@@ -239,8 +279,8 @@ func TestDaemonRunStartsL2Pipeline(t *testing.T) {
 		t.Fatal("L2 pipeline was not wired into daemon.Run")
 	}
 	waitForL2(t, 10*time.Second, func() bool {
-		ids, _, _ := l2.Search([]byte("wired needle"), 0)
-		return len(ids) == 1
+		keys, _, _ := l2.searchKeys([]byte("wired needle"), 0)
+		return len(keys) == 1
 	})
 	if roots := l2.Roots(); len(roots) != 1 || roots[0] != contentRoot {
 		t.Fatalf("L2 roots = %v, want [%s]", roots, contentRoot)

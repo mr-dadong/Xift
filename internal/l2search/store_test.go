@@ -13,9 +13,9 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("OpenStore: %v", err)
 	}
 	docs := []Doc{
-		{NodeID: 10, MTime: 100, Text: []byte("mutex guard around the map")},
-		{NodeID: 11, MTime: 200, Text: []byte("golang implementation notes")},
-		{NodeID: 12, MTime: 300, Text: []byte("设计文档 mutex 说明")},
+		{Key: DocKey{VolID: 1, NodeKey: 10}, MTime: 100, Text: []byte("mutex guard around the map")},
+		{Key: DocKey{VolID: 1, NodeKey: 11}, MTime: 200, Text: []byte("golang implementation notes")},
+		{Key: DocKey{VolID: 1, NodeKey: 12}, MTime: 300, Text: []byte("设计文档 mutex 说明")},
 	}
 	if err := st.AddSegment(docs); err != nil {
 		t.Fatalf("AddSegment: %v", err)
@@ -46,8 +46,8 @@ func TestStoreRoundTrip(t *testing.T) {
 		if !ok {
 			t.Fatalf("Doc(0,%d) missing", i)
 		}
-		if rec.NodeID != want.NodeID || rec.MTime != want.MTime {
-			t.Fatalf("Doc(0,%d) = %+v, want node %d mtime %d", i, rec, want.NodeID, want.MTime)
+		if rec.Key != want.Key || rec.MTime != want.MTime {
+			t.Fatalf("Doc(0,%d) = %+v, want key %+v mtime %d", i, rec, want.Key, want.MTime)
 		}
 	}
 	if _, ok := st.Doc(0, 99); ok {

@@ -220,3 +220,16 @@ func (p *Provider) ScanSubtree(ctx context.Context, vol provider.VolumeInfo, dir
 	cache := p.getOrCreatePathCache(vol.VolID)
 	return p.scanDirectoryTopDown(ctx, vol, dirPath, dirKey, false, writer, cache)
 }
+
+// ScanSubtreeWithRoot resolves the root FRN and emits the root record first.
+func (p *Provider) ScanSubtreeWithRoot(ctx context.Context, vol provider.VolumeInfo, dirPath string, writer provider.SegmentWriter) error {
+	if dirPath == "" || writer == nil {
+		return provider.ErrInvalidVolume
+	}
+	if !p.opts.DisableLowPriority {
+		restore := provider.SetLowPriorityThread()
+		defer restore()
+	}
+	cache := p.getOrCreatePathCache(vol.VolID)
+	return p.scanDirectoryTopDown(ctx, vol, dirPath, 0, true, writer, cache)
+}

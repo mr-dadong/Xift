@@ -9,30 +9,37 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/mr-dadong/Xift/internal/storage/lsm"
 	"github.com/mr-dadong/Xift/internal/textkey"
 )
 
 const (
-	manifestVersion = 1
-	docRecordSize   = 24
+	manifestVersion = 2
+	docRecordSize   = 32
 )
+
+// DocKey is the stable identity of a file: its volume and filesystem key.
+type DocKey struct {
+	VolID   uint16
+	NodeKey uint64
+}
 
 // Doc is one file's indexable content.
 type Doc struct {
-	NodeID uint32
-	MTime  int64
-	Text   []byte
+	Key   DocKey
+	MTime int64
+	Text  []byte
 }
 
 // DocRecord is the persisted header of one indexed document.
 type DocRecord struct {
-	NodeID uint32
-	Gen    uint32
-	MTime  int64
-	Off    uint64
-	Len    uint32
+	Key   DocKey
+	Gen   uint32
+	MTime int64
+	Off   uint64
+	Len   uint32
 }
 
 type segmentMeta struct {
@@ -70,6 +77,22 @@ type Store struct {
 	diskCap int64
 }
 
+// archiveStoreDir renames an incompatible L2 directory aside and recreates an
+// empty one, preserving the old data for manual rollback.
+func archiveStoreDir(dir string, version int) error {
+	backup := fmt.Sprintf("%s.v%d.bak", dir, version)
+	if _, err := os.Stat(backup); err == nil {
+		backup = fmt.Sprintf("%s.v%d.bak-%d", dir, version, time.Now().UnixNano())
+	}
+	if err := os.Rename(dir, backup); err != nil {
+		return fmt.Errorf("l2search: archive L2 index v%d: %w", version, err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("l2search: recreate L2 index dir: %w", err)
+	}
+	return nil
+}
+
 // ErrDiskCap reports that the L2 index reached its configured disk budget and
 // new documents are paused until segments are merged or the cap is raised.
 var ErrDiskCap = fmt.Errorf("l2search: content index disk cap reached")
@@ -92,7 +115,13 @@ func OpenStore(dir string, cache *lsm.BlockCache) (*Store, error) {
 		return nil, fmt.Errorf("l2search: corrupt MANIFEST: %w", err)
 	}
 	if s.mf.Version != manifestVersion {
-		return nil, fmt.Errorf("l2search: unsupported MANIFEST version %d", s.mf.Version)
+		// L2 is a rebuildable cache: archive the incompatible index and start
+		// clean rather than migrating document identities.
+		if err := archiveStoreDir(dir, s.mf.Version); err != nil {
+			return nil, err
+		}
+		s.mf = manifest{Version: manifestVersion, NextSegmentID: 1}
+		return s, nil
 	}
 	for _, m := range s.mf.Segments {
 		seg, err := openStoreSegment(filepath.Join(dir, fmt.Sprintf("seg_%06d", m.ID)), m)
@@ -191,10 +220,12 @@ func (s *Store) addSegmentLocked(docs []Doc) error {
 	var rec [docRecordSize]byte
 	var off uint64
 	for i := range docs {
-		binary.LittleEndian.PutUint32(rec[0:4], docs[i].NodeID)
-		binary.LittleEndian.PutUint32(rec[4:8], id)
-		binary.LittleEndian.PutUint64(rec[8:16], uint64(docs[i].MTime))
-		binary.LittleEndian.PutUint64(rec[16:24], off)
+		binary.LittleEndian.PutUint16(rec[0:2], docs[i].Key.VolID)
+		binary.LittleEndian.PutUint16(rec[2:4], 0)
+		binary.LittleEndian.PutUint64(rec[4:12], docs[i].Key.NodeKey)
+		binary.LittleEndian.PutUint32(rec[12:16], id)
+		binary.LittleEndian.PutUint64(rec[16:24], uint64(docs[i].MTime))
+		binary.LittleEndian.PutUint64(rec[24:32], off)
 		if _, err := f.Write(rec[:]); err != nil {
 			f.Close()
 			cf.Close()
@@ -277,22 +308,25 @@ func (s *Store) Doc(segIdx int, local uint32) (DocRecord, bool) {
 	if _, err := seg.docs.ReadAt(rec[:], int64(local)*docRecordSize); err != nil {
 		return DocRecord{}, false
 	}
-	off := binary.LittleEndian.Uint64(rec[16:24])
+	off := binary.LittleEndian.Uint64(rec[24:32])
 	next := uint64(0)
 	if local+1 < seg.meta.Docs {
 		var nrec [docRecordSize]byte
 		if _, err := seg.docs.ReadAt(nrec[:], int64(local+1)*docRecordSize); err == nil {
-			next = binary.LittleEndian.Uint64(nrec[16:24])
+			next = binary.LittleEndian.Uint64(nrec[24:32])
 		}
 	} else if info, err := seg.content.Stat(); err == nil {
 		next = uint64(info.Size())
 	}
 	return DocRecord{
-		NodeID: binary.LittleEndian.Uint32(rec[0:4]),
-		Gen:    binary.LittleEndian.Uint32(rec[4:8]),
-		MTime:  int64(binary.LittleEndian.Uint64(rec[8:16])),
-		Off:    off,
-		Len:    uint32(next - off),
+		Key: DocKey{
+			VolID:   binary.LittleEndian.Uint16(rec[0:2]),
+			NodeKey: binary.LittleEndian.Uint64(rec[4:12]),
+		},
+		Gen:   binary.LittleEndian.Uint32(rec[12:16]),
+		MTime: int64(binary.LittleEndian.Uint64(rec[16:24])),
+		Off:   off,
+		Len:   uint32(next - off),
 	}, true
 }
 

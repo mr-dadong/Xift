@@ -56,9 +56,9 @@ func TestL2ResourceBudget(t *testing.T) {
 		}
 	}
 
-	p, err := OpenL2Pipeline(ctx, dataDir, L2Config{
+	p, err := OpenL2Pipeline(ctx, dataDir, store, L2Config{
 		VolRoots:  map[uint16]string{1: root},
-		Resolver:  newPathIDResolver(),
+		Scanner:   treeScanner{},
 		Debounce:  time.Minute,
 		BatchDocs: 5000,
 	})
