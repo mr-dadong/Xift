@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 
@@ -23,18 +25,22 @@ const (
 	segMetaSize     = 48
 	segMetaEndMagic = uint32(0x54464958) // "XIFT"
 
-	segFlagDense uint32 = 1 << 0
-	segFlagTier2 uint32 = 1 << 1
+	segFlagDense     uint32 = 1 << 0
+	segFlagTier2     uint32 = 1 << 1
+	segFlagDirSorted uint32 = 1 << 2
 )
 
 // SegmentMeta describes an immutable on-disk columnar segment.
 type SegmentMeta struct {
-	ID           uint32
-	BaseNodeID   uint32
-	NodeCount    uint32
-	NamesBytes   uint64
-	Dense        bool
-	Tier2        bool
+	ID         uint32
+	BaseNodeID uint32
+	NodeCount  uint32
+	NamesBytes uint64
+	Dense      bool
+	Tier2      bool
+	// DirSorted reports that dirs.col is ordered by (VolID, NodeKey), enabling
+	// binary-search lookups through the block cache.
+	DirSorted    bool
 	TombstoneGen uint32
 }
 
@@ -102,10 +108,31 @@ type SegmentBuilder struct {
 	t2names []t2NameEntry
 	gramBuf []uint64
 
+	// Build-time memory budget: names spill to sorted runs once nameBytes
+	// exceeds nameSpillBudget; inverted postings spill via InvertedBuilder.
+	nameBytes       int64
+	nameSpillBudget int64
+	nameRuns        []string
+
 	hotScratch [HotNodeSize]byte
 	u64Scratch [8]byte
 	u32Scratch [4]byte
 	closed     bool
+}
+
+// setBuildBudget configures Tier 2 spill budgets (names and both inverted
+// indexes) so a single segment's build state stays within bytes.
+func (b *SegmentBuilder) setBuildBudget(bytes int64) {
+	if bytes <= 0 || b.invTri == nil || b.invBi == nil {
+		return
+	}
+	// bytes is the process RSS target. Go's collector keeps the heap near twice
+	// the live set, so spill budgets cover 40% of it, leaving headroom for the
+	// runtime and non-spilled builders.
+	live := bytes * 40 / 100
+	b.nameSpillBudget = live * 40 / 100
+	b.invTri.ConfigureSpill(b.dir, live*35/100)
+	b.invBi.ConfigureSpill(b.dir, live*25/100)
 }
 
 // NewSegmentBuilder creates a new Tier 1 segment directory and opens column writers for streaming build.
@@ -380,6 +407,14 @@ func (b *SegmentBuilder) Finish() (SegmentMeta, error) {
 	if err := writeKeysIndex(filepath.Join(b.dir, "keys.idx"), b.keyEntries); err != nil {
 		return SegmentMeta{}, err
 	}
+	// Sort directory records by (VolID, NodeKey) so the reader can binary-search
+	// dirs.col through the block cache instead of materializing a map.
+	slices.SortFunc(b.dirEntries, func(a, b keyIndexEntry) int {
+		if c := cmp.Compare(a.VolID, b.VolID); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.NodeKey, b.NodeKey)
+	})
 	if err := writeKeysIndex(filepath.Join(b.dir, "dirs.col"), b.dirEntries); err != nil {
 		return SegmentMeta{}, err
 	}
@@ -396,6 +431,7 @@ func (b *SegmentBuilder) Finish() (SegmentMeta, error) {
 		NamesBytes:   b.nameOffset,
 		Dense:        b.dense,
 		Tier2:        b.tier2,
+		DirSorted:    true,
 		TombstoneGen: 0,
 	}
 	if err := writeSegmentMeta(filepath.Join(b.dir, "meta.hdr"), meta); err != nil {
@@ -465,6 +501,9 @@ func writeSegmentMeta(path string, meta SegmentMeta) error {
 	if meta.Tier2 {
 		flags |= segFlagTier2
 	}
+	if meta.DirSorted {
+		flags |= segFlagDirSorted
+	}
 	binary.LittleEndian.PutUint32(buf[16:20], flags)
 	binary.LittleEndian.PutUint32(buf[20:24], meta.BaseNodeID)
 	binary.LittleEndian.PutUint32(buf[24:28], meta.NodeCount)
@@ -500,6 +539,7 @@ func readSegmentMeta(path string) (SegmentMeta, error) {
 		ID:         binary.LittleEndian.Uint32(raw[12:16]),
 		Dense:      (flags & segFlagDense) != 0,
 		Tier2:      (flags & segFlagTier2) != 0,
+		DirSorted:  (flags & segFlagDirSorted) != 0,
 		BaseNodeID: binary.LittleEndian.Uint32(raw[20:24]),
 		NodeCount:  binary.LittleEndian.Uint32(raw[24:28]),
 		NamesBytes: binary.LittleEndian.Uint64(raw[28:36]),
@@ -529,14 +569,16 @@ type Segment struct {
 	mtimesFile *os.File
 
 	// Tier 2 state (nil for Tier 1 segments).
-	tier2    bool
-	cache    *lsm.BlockCache
-	hotR     *blockFileReader
-	keysR    *blockFileReader
-	nodeIDsR *blockFileReader
-	namesR   *lsm.NameBlocksReader
-	triIdx   *lsm.InvertedIndex
-	biIdx    *lsm.InvertedIndex
+	tier2     bool
+	cache     *lsm.BlockCache
+	hotR      *blockFileReader
+	keysR     *blockFileReader
+	nodeIDsR  *blockFileReader
+	dirsR     *blockFileReader
+	sizeBytes int64
+	namesR    *lsm.NameBlocksReader
+	triIdx    *lsm.InvertedIndex
+	biIdx     *lsm.InvertedIndex
 
 	// Copy-on-Write pointer-free tombstone bitmap (noscan).
 	// Writers hold Engine.mu.Lock; AcquireSnapshot sets delShared under RLock for zero-copy MVCC sharing.
@@ -544,6 +586,12 @@ type Segment struct {
 	deadCount uint32
 	delDirty  bool
 	delShared atomic.Bool
+
+	// Lazy directory map for unsorted dirs.col (Tier 1 / pre-sorted formats).
+	dirIdxMu    sync.Mutex
+	dirIdx      map[dirKey]uint32
+	dirIdxBuilt bool
+	dirIdxErr   error
 
 	refCount      atomic.Int32
 	removeOnClose atomic.Bool
@@ -579,6 +627,7 @@ func openSegment(segDir string, tombGen uint32, cache *lsm.BlockCache) (*Segment
 		cache: cache,
 	}
 	s.refCount.Store(1)
+	s.sizeBytes = dirBytes(segDir)
 
 	cleanup := true
 	defer func() {
@@ -729,6 +778,9 @@ func (s *Segment) openTier2Columns() error {
 			return fmt.Errorf("%w: nodeids.col record count mismatch", ErrCorruptSegment)
 		}
 	}
+	if s.dirsR, err = newBlockFileReader(filepath.Join(segDir, "dirs.col"), segID, lsm.BlockKindDirs, 16, s.cache); err != nil {
+		return fmt.Errorf("%w: open dirs.col reader: %v", ErrCorruptSegment, err)
+	}
 	if s.namesR, err = lsm.OpenNameBlocksReader(filepath.Join(segDir, "names.blk"), filepath.Join(segDir, "names.idx"), segID, s.cache); err != nil {
 		return fmt.Errorf("%w: open names.blk: %v", ErrCorruptSegment, err)
 	}
@@ -740,6 +792,27 @@ func (s *Segment) openTier2Columns() error {
 	}
 	return nil
 }
+
+// dirBytes sums the sizes of the regular files directly inside dir.
+func dirBytes(dir string) int64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// SizeBytes reports the segment's on-disk size, sampled when it was opened.
+func (s *Segment) SizeBytes() int64 { return s.sizeBytes }
 
 // Retain increments the segment reference count for safe concurrent snapshot access.
 func (s *Segment) Retain() {
@@ -780,6 +853,10 @@ func (s *Segment) closeHandles() {
 	if s.nodeIDsMap != nil {
 		_ = s.nodeIDsMap.Close()
 		s.nodeIDsMap = nil
+	}
+	if s.dirsR != nil {
+		s.dirsR.close()
+		s.dirsR = nil
 	}
 	if s.sizesFile != nil {
 		_ = s.sizesFile.Close()
@@ -1193,22 +1270,140 @@ func (s *Segment) PopulateLocalKeys(dst []uint64) error {
 	return nil
 }
 
+// dirKey identifies a directory by its on-disk volume and node key.
+type dirKey struct {
+	volID   uint16
+	nodeKey uint64
+}
+
+// DirID resolves a directory's (volID, nodeKey) to its NodeID without
+// materializing the whole mapping. Sorted dirs.col files are binary-searched
+// through the block cache; older/unsorted formats fall back to a lazily built
+// per-segment map.
+func (s *Segment) DirID(volID uint16, nodeKey uint64) (uint32, bool, error) {
+	if s.meta.DirSorted && s.dirsR != nil {
+		return s.dirIDBinary(volID, nodeKey)
+	}
+	idx, err := s.ensureDirIdx()
+	if err != nil {
+		return 0, false, err
+	}
+	localIdx, ok := idx[dirKey{volID: volID, nodeKey: nodeKey}]
+	if !ok || localIdx >= s.meta.NodeCount || s.IsDeleted(localIdx) {
+		return 0, false, nil
+	}
+	return s.NodeIDAt(localIdx), true, nil
+}
+
+// dirIDBinary binary-searches dirs.col, which is sorted by (VolID, NodeKey).
+func (s *Segment) dirIDBinary(volID uint16, nodeKey uint64) (uint32, bool, error) {
+	lo, hi := 0, s.dirsR.recordCount()
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		buf, off, err := s.dirsR.block(uint32(mid))
+		if err != nil {
+			return 0, false, err
+		}
+		recKey := binary.LittleEndian.Uint64(buf[off : off+8])
+		recVol := binary.LittleEndian.Uint16(buf[off+12 : off+14])
+		c := 0
+		switch {
+		case recVol < volID:
+			c = -1
+		case recVol > volID:
+			c = 1
+		case recKey < nodeKey:
+			c = -1
+		case recKey > nodeKey:
+			c = 1
+		}
+		switch {
+		case c < 0:
+			lo = mid + 1
+		case c > 0:
+			hi = mid
+		default:
+			localIdx := binary.LittleEndian.Uint32(buf[off+8 : off+12])
+			if localIdx >= s.meta.NodeCount || s.IsDeleted(localIdx) {
+				return 0, false, nil
+			}
+			return s.NodeIDAt(localIdx), true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+// dirIdxEntryBytes approximates the resident cost of one fallback-map entry
+// (key struct + value + map bucket overhead).
+const dirIdxEntryBytes = 48
+
+// dirIdxBytes reports the resident bytes held by the fallback directory index.
+func (s *Segment) dirIdxBytes() int64 {
+	s.dirIdxMu.Lock()
+	defer s.dirIdxMu.Unlock()
+	return int64(len(s.dirIdx)) * dirIdxEntryBytes
+}
+
+// ensureDirIdx lazily builds the directory map for formats without a sorted
+// dirs.col. The map is per segment and bounded by that segment's directory count.
+func (s *Segment) ensureDirIdx() (map[dirKey]uint32, error) {
+	s.dirIdxMu.Lock()
+	defer s.dirIdxMu.Unlock()
+	if s.dirIdxBuilt {
+		return s.dirIdx, s.dirIdxErr
+	}
+	idx := make(map[dirKey]uint32)
+	err := s.forEachDirRecord(func(nodeKey uint64, localIdx uint32, volID uint16) {
+		if localIdx < s.meta.NodeCount && !s.IsDeleted(localIdx) {
+			idx[dirKey{volID: volID, nodeKey: nodeKey}] = localIdx
+		}
+	})
+	if err != nil {
+		s.dirIdxErr = err
+		return nil, err
+	}
+	s.dirIdx = idx
+	s.dirIdxBuilt = true
+	return s.dirIdx, nil
+}
+
+// forEachDirRecord streams dirs.col records, using the block reader when the
+// segment is Tier 2 and a buffered file read otherwise.
+func (s *Segment) forEachDirRecord(fn func(nodeKey uint64, localIdx uint32, volID uint16)) error {
+	if s.dirsR != nil {
+		return s.dirsR.forEachRecord(func(rec []byte, _ int) bool {
+			fn(binary.LittleEndian.Uint64(rec[0:8]), binary.LittleEndian.Uint32(rec[8:12]), binary.LittleEndian.Uint16(rec[12:14]))
+			return true
+		})
+	}
+	f, err := os.Open(filepath.Join(s.dir, "dirs.col"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // older Tier 1 segments may omit dirs.col
+		}
+		return err
+	}
+	defer f.Close()
+	var rec [16]byte
+	for {
+		if _, err := io.ReadFull(f, rec[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return err
+		}
+		fn(binary.LittleEndian.Uint64(rec[0:8]), binary.LittleEndian.Uint32(rec[8:12]), binary.LittleEndian.Uint16(rec[12:14]))
+	}
+}
+
 // PopulateDirMap loads live directory mappings from dirs.col into dirMap without touching hot.col or keys.idx.
 func (s *Segment) PopulateDirMap(dirMap *KeyMap) error {
-	raw, err := os.ReadFile(filepath.Join(s.dir, "dirs.col"))
-	if err == nil {
-		if len(raw)%16 != 0 {
-			return fmt.Errorf("%w: invalid dirs.col size %d", ErrCorruptSegment, len(raw))
-		}
-		for off := 0; off < len(raw); off += 16 {
-			nodeKey := binary.LittleEndian.Uint64(raw[off : off+8])
-			localIdx := binary.LittleEndian.Uint32(raw[off+8 : off+12])
-			volID := binary.LittleEndian.Uint16(raw[off+12 : off+14])
+	if _, err := os.Stat(filepath.Join(s.dir, "dirs.col")); err == nil {
+		return s.forEachDirRecord(func(nodeKey uint64, localIdx uint32, volID uint16) {
 			if localIdx < s.meta.NodeCount && !s.IsDeleted(localIdx) {
 				dirMap.Put(volID, nodeKey, s.NodeIDAt(localIdx))
 			}
-		}
-		return nil
+		})
 	}
 	if s.tier2 {
 		return nil // dirs.col is always written for Tier 2 segments.

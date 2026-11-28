@@ -196,10 +196,11 @@ func TestInvertedNoFalseNegative(t *testing.T) {
 	for _, term := range terms {
 		plan := mustCompilePlan(t, store, term)
 		var cold int64
-		cands, err := scanInvertedSegment(context.Background(), snap, ss, plan, &cold)
-		if err != nil {
+		col := newLockedCollector(1_000_000)
+		if err := scanInvertedSegment(context.Background(), snap, ss, plan, &cold, col); err != nil {
 			t.Fatalf("scanInvertedSegment(%q): %v", term, err)
 		}
+		cands := col.col.results()
 		got := make(map[uint32]string, len(cands))
 		for _, c := range cands {
 			if _, name, ok := snap.LookupNode(c.nodeID); ok {

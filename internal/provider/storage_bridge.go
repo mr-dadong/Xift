@@ -14,7 +14,7 @@ import (
 type StorageSegmentWriter struct {
 	engine  *storage.Engine
 	vol     VolumeInfo
-	builder *storage.SegmentBuilder
+	dw      *storage.DenseWriter
 	extPool *storage.ExtPool
 
 	mu     sync.Mutex
@@ -28,14 +28,14 @@ func NewStorageSegmentWriter(engine *storage.Engine, vol VolumeInfo) (*StorageSe
 	if engine == nil {
 		return nil, fmt.Errorf("provider: nil storage engine")
 	}
-	builder, err := engine.BeginDenseSegment()
+	dw, err := engine.NewDenseWriter(storage.DefaultDenseSegmentNodes)
 	if err != nil {
 		return nil, err
 	}
 	return &StorageSegmentWriter{
 		engine:  engine,
 		vol:     vol,
-		builder: builder,
+		dw:      dw,
 		extPool: engine.ExtPool(),
 		dirIDs:  storage.NewKeyMap(4096),
 	}, nil
@@ -75,7 +75,7 @@ func (w *StorageSegmentWriter) WriteRecord(rec ScanRecord) error {
 	}
 
 	extID := w.extPool.InternFromName(rec.Name, isDir)
-	nodeID, err := w.builder.AppendDense(volID, rec.NodeKey, parentIdx, rec.Name, flags, extID, size, rec.ModTime)
+	nodeID, err := w.dw.Append(volID, rec.NodeKey, parentIdx, rec.Name, flags, extID, size, rec.ModTime)
 	if err != nil {
 		return err
 	}
@@ -89,10 +89,10 @@ func (w *StorageSegmentWriter) WriteRecord(rec ScanRecord) error {
 func (w *StorageSegmentWriter) Count() uint32 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.builder == nil {
+	if w.dw == nil {
 		return 0
 	}
-	return w.builder.Count()
+	return w.dw.Count()
 }
 
 // Commit finishes the dense segment, mounts it atomically in MANIFEST, and persists vol's journal cursor.
@@ -104,20 +104,12 @@ func (w *StorageSegmentWriter) Commit(cursor uint64) (storage.SegmentMeta, error
 	}
 	w.closed = true
 
-	meta, err := w.builder.Finish()
-	if err != nil {
-		w.builder.Abort()
-		return storage.SegmentMeta{}, err
-	}
 	vc := &storage.VolumeCursor{
 		VolID:    w.vol.VolID,
 		Cursor:   cursor,
 		RootPath: w.vol.RootPath,
 	}
-	if err := w.engine.CommitSegment(meta, vc); err != nil {
-		return storage.SegmentMeta{}, err
-	}
-	return meta, nil
+	return w.dw.Commit(vc)
 }
 
 // Abort discards an uncommitted dense segment and releases engine build reservation. Idempotent.
@@ -128,8 +120,8 @@ func (w *StorageSegmentWriter) Abort() {
 		return
 	}
 	w.closed = true
-	if w.builder != nil {
-		w.builder.Abort()
+	if w.dw != nil {
+		w.dw.Abort()
 	}
 }
 

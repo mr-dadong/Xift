@@ -142,6 +142,7 @@ func LoadManifest(path string) (*Manifest, bool, error) {
 			NamesBytes:   binary.LittleEndian.Uint64(payload[off+12 : off+20]),
 			Dense:        (payload[off+20] & 1) != 0,
 			Tier2:        (payload[off+20] & 2) != 0,
+			DirSorted:    (payload[off+20] & 4) != 0,
 			TombstoneGen: binary.LittleEndian.Uint32(payload[off+21 : off+25]),
 		}
 		off += manifestSegSize
@@ -222,6 +223,9 @@ func (m *Manifest) Save(path string) error {
 		}
 		if sm.Tier2 {
 			buf[off+20] |= 2
+		}
+		if sm.DirSorted {
+			buf[off+20] |= 4
 		}
 		binary.LittleEndian.PutUint32(buf[off+21:off+25], sm.TombstoneGen)
 		off += manifestSegSize

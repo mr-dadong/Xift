@@ -39,6 +39,13 @@ type report struct {
 	CacheLimit  int64   `json:"cache_limit_bytes"`
 	QueryOnly   bool    `json:"query_only,omitempty"`
 	Terms       string  `json:"terms,omitempty"`
+	Segments    int     `json:"segments,omitempty"`
+	WideCount   int     `json:"wide_count,omitempty"`
+	NarrowCount int     `json:"narrow_count,omitempty"`
+	WideP50Ms   float64 `json:"wide_p50_ms,omitempty"`
+	WideP95Ms   float64 `json:"wide_p95_ms,omitempty"`
+	NarrowP50Ms float64 `json:"narrow_p50_ms,omitempty"`
+	NarrowP95Ms float64 `json:"narrow_p95_ms,omitempty"`
 }
 
 func main() {
@@ -51,10 +58,12 @@ func main() {
 	queries := flag.Int("queries", 50, "query latency samples")
 	terms := flag.String("terms", queryTerms, "pipe-separated query terms")
 	queryOnly := flag.Bool("query-only", false, "query an existing -data-dir instead of building an index")
+	segMax := flag.Int("seg-max", 0, "max nodes per dense segment (0 = engine default)")
+	buildBudget := flag.Int64("build-budget", 0, "build memory budget in bytes (0 = engine default)")
 	asJSON := flag.Bool("json", false, "emit a JSON report")
 	flag.Parse()
 
-	rep, err := run(*nodes, *dirs, *dataDir, *keep, *tier2, *queryOnly, *cacheBytes, *queries, *terms)
+	rep, err := run(*nodes, *dirs, *dataDir, *keep, *tier2, *queryOnly, *cacheBytes, *queries, *terms, *segMax, *buildBudget)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 		os.Exit(1)
@@ -80,11 +89,18 @@ func main() {
 	}
 	fmt.Printf("Cold start:        %.2f ms\n", rep.ColdStartMs)
 	fmt.Printf("Query p50/p95/p99: %.2f / %.2f / %.2f ms (%d samples)\n", rep.QueryP50Ms, rep.QueryP95Ms, rep.QueryP99Ms, rep.QueryCount)
+	if rep.WideCount > 0 || rep.NarrowCount > 0 {
+		fmt.Printf("  wide (truncated):  %.2f / %.2f ms (%d)\n", rep.WideP50Ms, rep.WideP95Ms, rep.WideCount)
+		fmt.Printf("  narrow (complete): %.2f / %.2f ms (%d)\n", rep.NarrowP50Ms, rep.NarrowP95Ms, rep.NarrowCount)
+	}
+	if !rep.QueryOnly {
+		fmt.Printf("Segments:          %d\n", rep.Segments)
+	}
 	fmt.Printf("Query RSS:         %.2f MiB (HeapAlloc %.2f MiB)\n", float64(rep.QueryRSS)/(1<<20), float64(rep.HeapAlloc)/(1<<20))
 	fmt.Printf("Block cache:       %.2f / %.2f MiB\n", float64(rep.CacheBytes)/(1<<20), float64(rep.CacheLimit)/(1<<20))
 }
 
-func run(nodes, dirs int, dataDir string, keep, tier2, queryOnly bool, cacheBytes int64, querySamples int, termList string) (report, error) {
+func run(nodes, dirs int, dataDir string, keep, tier2, queryOnly bool, cacheBytes int64, querySamples int, termList string, segMax int, buildBudget int64) (report, error) {
 	var rep report
 	rep.QueryOnly = queryOnly
 	if queryOnly {
@@ -112,13 +128,15 @@ func run(nodes, dirs int, dataDir string, keep, tier2, queryOnly bool, cacheByte
 	}
 
 	opts := storage.Options{
-		DisableWALSync:  true,
-		LowMemoryMode:   tier2,
-		BlockCacheBytes: cacheBytes,
+		DisableWALSync:    true,
+		LowMemoryMode:     tier2,
+		BlockCacheBytes:   cacheBytes,
+		DenseSegmentNodes: segMax,
+		BuildBudgetBytes:  buildBudget,
 	}
 
 	if !queryOnly {
-		if err := buildIndex(dataDir, opts, nodes, dirs, &rep); err != nil {
+		if err := buildIndex(dataDir, opts, nodes, dirs, segMax, &rep); err != nil {
 			return rep, err
 		}
 	}
@@ -150,15 +168,28 @@ func run(nodes, dirs int, dataDir string, keep, tier2, queryOnly bool, cacheByte
 	}
 
 	latencies := make([]time.Duration, 0, querySamples)
+	var wideLat, narrowLat []time.Duration
 	for i := 0; i < querySamples; i++ {
 		term := terms[i%len(terms)]
 		begin := time.Now()
-		if _, err := qe.Search(ctx, term, searchOpts); err != nil {
+		res, err := qe.Search(ctx, term, searchOpts)
+		if err != nil {
 			return rep, fmt.Errorf("query %q: %w", term, err)
 		}
-		latencies = append(latencies, time.Since(begin))
+		d := time.Since(begin)
+		latencies = append(latencies, d)
+		if res.Truncated {
+			wideLat = append(wideLat, d)
+		} else {
+			narrowLat = append(narrowLat, d)
+		}
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	rep.WideCount, rep.NarrowCount = len(wideLat), len(narrowLat)
+	sort.Slice(wideLat, func(i, j int) bool { return wideLat[i] < wideLat[j] })
+	sort.Slice(narrowLat, func(i, j int) bool { return narrowLat[i] < narrowLat[j] })
+	rep.WideP50Ms, rep.WideP95Ms = msAt(wideLat, 0.50), msAt(wideLat, 0.95)
+	rep.NarrowP50Ms, rep.NarrowP95Ms = msAt(narrowLat, 0.50), msAt(narrowLat, 0.95)
 	rep.QueryCount = len(latencies)
 	rep.QueryP50Ms = msAt(latencies, 0.50)
 	rep.QueryP95Ms = msAt(latencies, 0.95)
@@ -179,16 +210,16 @@ func run(nodes, dirs int, dataDir string, keep, tier2, queryOnly bool, cacheByte
 
 // buildIndex streams a synthetic corpus into a fresh dense segment and fills the
 // build metrics of rep.
-func buildIndex(dataDir string, opts storage.Options, nodes, dirs int, rep *report) error {
+func buildIndex(dataDir string, opts storage.Options, nodes, dirs, segMax int, rep *report) error {
 	buildStart := time.Now()
 	store, err := storage.Open(dataDir, opts)
 	if err != nil {
 		return fmt.Errorf("open index: %w", err)
 	}
-	builder, err := store.BeginDenseSegment()
+	dw, err := store.NewDenseWriter(segMax)
 	if err != nil {
 		_ = store.Close()
-		return fmt.Errorf("begin dense segment: %w", err)
+		return fmt.Errorf("begin dense writer: %w", err)
 	}
 
 	counts := syntheticCounts{Dirs: dirs, Files: nodes}
@@ -208,7 +239,7 @@ func buildIndex(dataDir string, opts storage.Options, nodes, dirs int, rep *repo
 		if row.IsDir {
 			flags = storage.FlagDir
 		}
-		if _, appendErr = builder.AppendDense(1, row.NodeKey, parentID, row.Name, flags, 0, row.Size, row.ModTime); appendErr != nil {
+		if _, appendErr = dw.Append(1, row.NodeKey, parentID, row.Name, flags, 0, row.Size, row.ModTime); appendErr != nil {
 			return
 		}
 		seen++
@@ -217,20 +248,15 @@ func buildIndex(dataDir string, opts storage.Options, nodes, dirs int, rep *repo
 		}
 	})
 	if appendErr != nil {
-		builder.Abort()
+		dw.Abort()
 		_ = store.Close()
 		return fmt.Errorf("append: %w", appendErr)
 	}
-	meta, err := builder.Finish()
-	if err != nil {
-		builder.Abort()
+	if _, err := dw.Commit(nil); err != nil {
 		_ = store.Close()
-		return fmt.Errorf("finish segment: %w", err)
+		return fmt.Errorf("commit segments: %w", err)
 	}
-	if err := store.CommitSegment(meta, nil); err != nil {
-		_ = store.Close()
-		return fmt.Errorf("commit segment: %w", err)
-	}
+	rep.Segments = len(dw.Segments())
 	rep.BuildMs = float64(time.Since(buildStart).Microseconds()) / 1000.0
 	rep.BuildRSS = residentBytes()
 	return store.Close()

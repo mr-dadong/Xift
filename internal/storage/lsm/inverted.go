@@ -1,13 +1,16 @@
 package lsm
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
+	"sync/atomic"
 )
 
 // Inverted index file layout (trigram.idx / bigram.idx):
@@ -58,11 +61,24 @@ type InvertedBuilder struct {
 	postings map[uint64]*RoaringBuilder
 	lastIdx  uint32
 	hasLast  bool
+
+	// Optional spilling: when the estimated resident posting bytes exceed the
+	// budget, completed containers are written to sorted run files and merged
+	// back at Finish, keeping build memory bounded.
+	spillDir string
+	budget   int64
+	estBytes int64
+	runs     []string
+	runSeq   uint64
 }
+
+// invBuilderSeq gives each builder a unique run-file prefix so trigram and
+// bigram spilling into one segment directory never collide.
+var invBuilderSeq atomic.Uint64
 
 // NewInvertedBuilder creates an empty builder.
 func NewInvertedBuilder() *InvertedBuilder {
-	return &InvertedBuilder{postings: make(map[uint64]*RoaringBuilder, 1024)}
+	return &InvertedBuilder{postings: make(map[uint64]*RoaringBuilder, 1024), runSeq: invBuilderSeq.Add(1)}
 }
 
 // AddName contributes one name's gram keys for localIdx.
@@ -87,13 +103,80 @@ func (b *InvertedBuilder) AddName(keys []uint64, localIdx uint32) error {
 	}
 	b.lastIdx = localIdx
 	b.hasLast = true
+	b.estBytes += int64(len(sorted)) * 4
+	if b.budget > 0 && b.spillDir != "" && b.estBytes >= b.budget {
+		return b.spill()
+	}
 	return nil
+}
+
+// ConfigureSpill enables posting spilling into dir once the estimated resident
+// posting bytes reach budget. budget <= 0 disables spilling.
+func (b *InvertedBuilder) ConfigureSpill(dir string, budget int64) {
+	b.spillDir = dir
+	b.budget = budget
+}
+
+// spill writes every gram's completed containers to a sorted run file.
+func (b *InvertedBuilder) spill() error {
+	keys := make([]uint64, 0, len(b.postings))
+	for k := range b.postings {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	path := filepath.Join(b.spillDir, fmt.Sprintf("inv-%d-run-%03d.tmp", b.runSeq, len(b.runs)))
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	bw := bufio.NewWriterSize(f, 256*1024)
+	var hdr [12]byte
+	for _, k := range keys {
+		blob := b.postings[k].Spill()
+		if len(blob) == 0 {
+			continue
+		}
+		binary.LittleEndian.PutUint64(hdr[0:8], k)
+		binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(blob)))
+		if _, err := bw.Write(hdr[:]); err != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return err
+		}
+		if _, err := bw.Write(blob); err != nil {
+			_ = f.Close()
+			_ = os.Remove(path)
+			return err
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	b.runs = append(b.runs, path)
+	b.estBytes = 0
+	return nil
+}
+
+func (b *InvertedBuilder) removeRuns() {
+	for _, p := range b.runs {
+		_ = os.Remove(p)
+	}
+	b.runs = nil
 }
 
 // Finish serializes the index to path. Grams whose document frequency exceeds
 // maxDF are excluded (bigram high-frequency cutoff); pass math.MaxInt32 to
 // keep everything.
 func (b *InvertedBuilder) Finish(path string, maxDF int) (InvertedStats, error) {
+	if len(b.runs) > 0 {
+		return b.finishSpilled(path, maxDF)
+	}
 	keys := make([]uint64, 0, len(b.postings))
 	for k := range b.postings {
 		keys = append(keys, k)
@@ -194,6 +277,236 @@ func (b *InvertedBuilder) Finish(path string, maxDF int) (InvertedStats, error) 
 
 	b.postings = nil
 	return InvertedStats{GramCount: len(entries), PostingsBytes: int64(postingsBytes), MaxDF: maxKeptDF}, nil
+}
+
+// invRun is one spilled posting run, read sequentially in ascending gram order.
+type invRun struct {
+	f    *os.File
+	r    *bufio.Reader
+	key  uint64
+	blob []byte
+	ok   bool
+}
+
+func openInvRun(path string) (*invRun, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	c := &invRun{f: f, r: bufio.NewReaderSize(f, 256*1024)}
+	if err := c.advance(); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *invRun) advance() error {
+	var hdr [12]byte
+	if _, err := io.ReadFull(c.r, hdr[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			c.ok = false
+			c.blob = nil
+			return nil
+		}
+		return err
+	}
+	n := binary.LittleEndian.Uint32(hdr[8:12])
+	if cap(c.blob) < int(n) {
+		c.blob = make([]byte, n)
+	} else {
+		c.blob = c.blob[:n]
+	}
+	if _, err := io.ReadFull(c.r, c.blob); err != nil {
+		return err
+	}
+	c.key = binary.LittleEndian.Uint64(hdr[0:8])
+	c.ok = true
+	return nil
+}
+
+// finishSpilled merges the spill runs with the live postings and writes the
+// same on-disk layout the in-memory path produces. Postings go to a temporary
+// file first because the header needs their total size before they are copied.
+func (b *InvertedBuilder) finishSpilled(path string, maxDF int) (InvertedStats, error) {
+	defer b.removeRuns()
+
+	var cursors []*invRun
+	defer func() {
+		for _, c := range cursors {
+			_ = c.f.Close()
+		}
+	}()
+	for _, p := range b.runs {
+		c, err := openInvRun(p)
+		if err != nil {
+			return InvertedStats{}, err
+		}
+		cursors = append(cursors, c)
+	}
+
+	liveKeys := make([]uint64, 0, len(b.postings))
+	for k := range b.postings {
+		liveKeys = append(liveKeys, k)
+	}
+	slices.Sort(liveKeys)
+
+	postPath := path + ".post"
+	pf, err := os.Create(postPath)
+	if err != nil {
+		return InvertedStats{}, err
+	}
+	cleanupPost := func() {
+		_ = pf.Close()
+		_ = os.Remove(postPath)
+	}
+	bw := bufio.NewWriterSize(pf, 256*1024)
+
+	var keys []uint64
+	var cards []uint32
+	var offs []uint64
+	var postingsBytes uint64
+	maxKeptDF := uint32(0)
+	var u32 [4]byte
+	li := 0
+	var blob []byte
+
+	for {
+		min := ^uint64(0)
+		found := false
+		if li < len(liveKeys) {
+			min = liveKeys[li]
+			found = true
+		}
+		for _, c := range cursors {
+			if c.ok && c.key < min {
+				min = c.key
+				found = true
+			}
+		}
+		if !found {
+			break
+		}
+		blob = blob[:0]
+		for _, c := range cursors {
+			if c.ok && c.key == min {
+				blob = append(blob, c.blob...)
+				if err := c.advance(); err != nil {
+					cleanupPost()
+					return InvertedStats{}, err
+				}
+			}
+		}
+		if li < len(liveKeys) && liveKeys[li] == min {
+			rest, _ := b.postings[min].Finish()
+			blob = append(blob, rest...)
+			li++
+		}
+
+		card := uint64(0)
+		if len(blob) > 0 {
+			v, err := ParseRoaring(blob)
+			if err != nil {
+				cleanupPost()
+				return InvertedStats{}, err
+			}
+			card = v.Cardinality()
+		}
+		if int(card) > maxDF {
+			blob = nil
+			card = 0
+		} else if uint32(card) > maxKeptDF {
+			maxKeptDF = uint32(card)
+		}
+
+		keys = append(keys, min)
+		cards = append(cards, uint32(card))
+		offs = append(offs, postingsBytes)
+		binary.LittleEndian.PutUint32(u32[:], lsmCRC32C(blob))
+		if _, err := bw.Write(u32[:]); err != nil {
+			cleanupPost()
+			return InvertedStats{}, err
+		}
+		if _, err := bw.Write(blob); err != nil {
+			cleanupPost()
+			return InvertedStats{}, err
+		}
+		postingsBytes += uint64(4 + len(blob))
+	}
+	if err := bw.Flush(); err != nil {
+		cleanupPost()
+		return InvertedStats{}, err
+	}
+	if err := pf.Close(); err != nil {
+		_ = os.Remove(postPath)
+		return InvertedStats{}, err
+	}
+
+	// Assemble the final file: header, dictionary, df, offsets, then postings.
+	f, err := os.Create(path)
+	if err != nil {
+		_ = os.Remove(postPath)
+		return InvertedStats{}, err
+	}
+	fail := func(err error) (InvertedStats, error) {
+		_ = f.Close()
+		_ = os.Remove(path)
+		_ = os.Remove(postPath)
+		return InvertedStats{}, err
+	}
+	var hdr [invertedHdrSize]byte
+	copy(hdr[0:], invertedMagic)
+	binary.LittleEndian.PutUint32(hdr[8:], invertedVersion)
+	binary.LittleEndian.PutUint32(hdr[12:], uint32(len(keys)))
+	binary.LittleEndian.PutUint32(hdr[16:], uint32(len(keys)*8))
+	binary.LittleEndian.PutUint32(hdr[20:], uint32(len(keys)*4))
+	binary.LittleEndian.PutUint64(hdr[24:], postingsBytes)
+	binary.LittleEndian.PutUint32(hdr[32:], lsmCRC32C(hdr[:32]))
+	if _, err := f.Write(hdr[:]); err != nil {
+		return fail(err)
+	}
+	var u64 [8]byte
+	for _, k := range keys {
+		binary.LittleEndian.PutUint64(u64[:], k)
+		if _, err := f.Write(u64[:]); err != nil {
+			return fail(err)
+		}
+	}
+	for _, c := range cards {
+		binary.LittleEndian.PutUint32(u32[:], c)
+		if _, err := f.Write(u32[:]); err != nil {
+			return fail(err)
+		}
+	}
+	for _, o := range offs {
+		binary.LittleEndian.PutUint64(u64[:], o)
+		if _, err := f.Write(u64[:]); err != nil {
+			return fail(err)
+		}
+	}
+	binary.LittleEndian.PutUint64(u64[:], postingsBytes)
+	if _, err := f.Write(u64[:]); err != nil {
+		return fail(err)
+	}
+	postFile, err := os.Open(postPath)
+	if err != nil {
+		return fail(err)
+	}
+	if _, err := io.Copy(f, postFile); err != nil {
+		postFile.Close()
+		return fail(err)
+	}
+	postFile.Close()
+	_ = os.Remove(postPath)
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		return InvertedStats{}, err
+	}
+
+	b.postings = nil
+	return InvertedStats{GramCount: len(keys), PostingsBytes: int64(postingsBytes), MaxDF: maxKeptDF}, nil
 }
 
 // InvertedIndex is a lazily-read inverted index file. Dictionary, df, and

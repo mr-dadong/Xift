@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,13 +23,20 @@ type Options struct {
 	Tier2Threshold uint64
 	// LowMemoryMode forces RecommendedTier to return Tier2LSM regardless of live node count.
 	LowMemoryMode bool
+	// BuildBudgetBytes bounds one dense segment's build-time resident state;
+	// names and inverted postings spill to sorted runs beyond it.
+	// Defaults to DefaultBuildBudgetBytes.
+	BuildBudgetBytes int64
+	// DenseSegmentNodes bounds how many nodes one dense segment holds.
+	// Defaults to DefaultDenseSegmentNodes.
+	DenseSegmentNodes int
 	// MemTableFlushThreshold is the MemTable entry count at which AutoFlush triggers.
 	// Defaults to DefaultMemTableFlushThreshold (65,536).
 	MemTableFlushThreshold int
 	// AutoFlush automatically flushes MemTable to a delta segment when MemTableFlushThreshold is reached.
 	AutoFlush bool
 	// BlockCacheBytes is the hard byte budget of the Tier 2 shared block
-	// cache. Zero selects lsm.DefaultBlockCacheBytes (128 MB).
+	// cache. Zero selects lsm.DefaultBlockCacheBytes (96 MiB).
 	BlockCacheBytes int64
 	// DisableBackgroundMaintenance suppresses automatic background maintenance:
 	// the Tier 2 rebuild that merges Tier 1 segments after a tier switch and
@@ -64,7 +72,6 @@ type Engine struct {
 	mem              *MemTable
 	memShared        atomic.Bool // true when at least one Snapshot shares e.mem (CoW on next write)
 	writeGen         uint64      // monotonically incremented under e.mu.Lock on any mutation/segment change
-	dirByKey         *KeyMap
 	openStats        OpenStats
 	blockCache       *lsm.BlockCache
 	// tier2Sticky latches once the engine crosses into Tier 2; every segment
@@ -80,7 +87,10 @@ type Engine struct {
 const (
 	// tier2CompactionSegmentThreshold is the segment count above which the
 	// oldest segments are merged in the background.
-	tier2CompactionSegmentThreshold = 8
+	tier2CompactionSegmentThreshold = 32
+	// tier2CompactionBytesThreshold triggers the same merge when the committed
+	// segments exceed this total size, even below the segment-count threshold.
+	tier2CompactionBytesThreshold int64 = 4 << 30
 	// tier2CompactionBatch is how many of the oldest segments one run merges.
 	tier2CompactionBatch = 8
 )
@@ -102,7 +112,7 @@ func (e *Engine) maybeScheduleMaintenanceLocked() {
 			break
 		}
 	}
-	if !hybrid && len(e.segments) <= tier2CompactionSegmentThreshold {
+	if !hybrid && !e.needsTieredCompactionLocked() {
 		return
 	}
 	if !e.maintenanceActive.CompareAndSwap(false, true) {
@@ -124,6 +134,19 @@ func (e *Engine) maybeScheduleMaintenanceLocked() {
 		}
 		_ = e.CompactOldest(n)
 	}()
+}
+
+// needsTieredCompactionLocked reports whether the committed segments exceed the
+// segment-count or total-size threshold. Callers hold e.mu.
+func (e *Engine) needsTieredCompactionLocked() bool {
+	if len(e.segments) > tier2CompactionSegmentThreshold {
+		return true
+	}
+	var total int64
+	for _, s := range e.segments {
+		total += s.SizeBytes()
+	}
+	return total > tier2CompactionBytesThreshold
 }
 
 // manifestBackupSuffix names the one-generation MANIFEST snapshot kept from
@@ -198,6 +221,12 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 	if opts.MemTableFlushThreshold <= 0 {
 		opts.MemTableFlushThreshold = DefaultMemTableFlushThreshold
 	}
+	if opts.BuildBudgetBytes <= 0 {
+		opts.BuildBudgetBytes = DefaultBuildBudgetBytes
+	}
+	if opts.DenseSegmentNodes <= 0 {
+		opts.DenseSegmentNodes = DefaultDenseSegmentNodes
+	}
 
 	indexDir := filepath.Join(dataDir, "index")
 	segDir := filepath.Join(indexDir, "segments")
@@ -253,15 +282,6 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 		}
 	}
 
-	// Rebuild pointer-free DirByKey quickly from dirs.col (without paging in hot.col / names.col).
-	dirByKey := NewKeyMap(256)
-	for _, s := range segments {
-		if err := s.PopulateDirMap(dirByKey); err != nil {
-			closeOpened()
-			return nil, err
-		}
-	}
-
 	// Open WAL fenced by MANIFEST.WALGeneration and replay committed incremental mutations.
 	wal, replayed, truncatedBytes, err := OpenWAL(filepath.Join(indexDir, "wal.log"), manifest.WALGeneration, !opts.DisableWALSync)
 	if err != nil {
@@ -279,7 +299,6 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 		wal:        wal,
 		segments:   segments,
 		mem:        NewMemTable(max(len(replayed), 64)),
-		dirByKey:   dirByKey,
 		blockCache: blockCache,
 		closeDone:  make(chan struct{}),
 	}
@@ -389,12 +408,129 @@ func (e *Engine) BeginDenseSegment() (*SegmentBuilder, error) {
 		e.mu.Unlock()
 		return nil, err
 	}
+	b.setBuildBudget(e.opts.BuildBudgetBytes)
 	b.onAbort = func() {
 		e.mu.Lock()
 		e.denseBuildActive = false
 		e.mu.Unlock()
 	}
 	return b, nil
+}
+
+// DefaultDenseSegmentNodes bounds how many nodes one dense segment holds, so a
+// full-volume build releases its name/inverted buffers every N nodes instead of
+// accumulating the whole volume in memory.
+const DefaultDenseSegmentNodes = 10_000_000
+
+// DefaultBuildBudgetBytes bounds one dense segment's build-time resident state.
+const DefaultBuildBudgetBytes int64 = 2 << 30
+
+// DenseWriter streams a volume into one or more dense segments, committing each
+// chunk as it fills. Parent/child references use global NodeIDs, so splitting a
+// volume across segments preserves query semantics.
+type DenseWriter struct {
+	e     *Engine
+	max   int
+	cur   *SegmentBuilder
+	metas []SegmentMeta
+}
+
+// NewDenseWriter starts a chunked dense build. max <= 0 uses
+// DefaultDenseSegmentNodes.
+func (e *Engine) NewDenseWriter(max int) (*DenseWriter, error) {
+	if max <= 0 {
+		max = e.opts.DenseSegmentNodes
+	}
+	if max <= 0 {
+		max = DefaultDenseSegmentNodes
+	}
+	b, err := e.BeginDenseSegment()
+	if err != nil {
+		return nil, err
+	}
+	return &DenseWriter{e: e, max: max, cur: b}, nil
+}
+
+// Append adds one node, rolling to a fresh segment when the current one is full.
+func (w *DenseWriter) Append(volID uint16, nodeKey uint64, parentIdx uint32, name string, flags uint16, extID uint16, size, modTime int64) (uint32, error) {
+	if w.cur == nil {
+		return 0, ErrClosed
+	}
+	if w.max > 0 && w.cur.Count() >= uint32(w.max) {
+		if err := w.roll(); err != nil {
+			return 0, err
+		}
+	}
+	return w.cur.AppendDense(volID, nodeKey, parentIdx, name, flags, extID, size, modTime)
+}
+
+// roll finishes and commits the current segment, then opens the next one.
+func (w *DenseWriter) roll() error {
+	if w.cur.Count() == 0 {
+		return nil
+	}
+	meta, err := w.cur.Finish()
+	if err != nil {
+		w.cur.Abort()
+		w.cur = nil
+		return err
+	}
+	if err := w.e.CommitSegment(meta, nil); err != nil {
+		w.cur = nil
+		return err
+	}
+	w.metas = append(w.metas, meta)
+	b, err := w.e.BeginDenseSegment()
+	if err != nil {
+		w.cur = nil
+		return err
+	}
+	w.cur = b
+	return nil
+}
+
+// Commit finishes the final segment, persists the volume cursor on it, and
+// returns the last committed segment meta.
+func (w *DenseWriter) Commit(cursor *VolumeCursor) (SegmentMeta, error) {
+	if w.cur == nil {
+		return SegmentMeta{}, ErrClosed
+	}
+	meta, err := w.cur.Finish()
+	if err != nil {
+		w.cur.Abort()
+		w.cur = nil
+		return SegmentMeta{}, err
+	}
+	if err := w.e.CommitSegment(meta, cursor); err != nil {
+		w.cur = nil
+		return SegmentMeta{}, err
+	}
+	w.metas = append(w.metas, meta)
+	w.cur = nil
+	return meta, nil
+}
+
+// Count returns the total nodes appended across committed and in-progress chunks.
+func (w *DenseWriter) Count() uint32 {
+	var n uint32
+	for _, m := range w.metas {
+		n += m.NodeCount
+	}
+	if w.cur != nil {
+		n += w.cur.Count()
+	}
+	return n
+}
+
+// Segments returns the metas committed so far, in append order.
+func (w *DenseWriter) Segments() []SegmentMeta { return w.metas }
+
+// Abort discards the in-progress segment; already committed chunks stay.
+func (w *DenseWriter) Abort() {
+	if w.cur != nil {
+		w.cur.Abort()
+		w.cur = nil
+	}
 }
 
 // CommitSegment mounts a freshly built segment and atomically records it in MANIFEST,
@@ -467,9 +603,6 @@ func (e *Engine) CommitSegment(meta SegmentMeta, cursor *VolumeCursor) error {
 	e.manifest = nextManifest
 	e.segments = append(e.segments, seg)
 	e.writeGen++
-	if err := seg.PopulateDirMap(e.dirByKey); err != nil {
-		return err
-	}
 	return e.wal.Reset(nextManifest.WALGeneration)
 }
 
@@ -522,7 +655,10 @@ func (e *Engine) ApplyBatch(muts []Mutation) error {
 func (e *Engine) applyMutationLocked(m Mutation) error {
 	switch m.Op {
 	case OpCreate:
-		parentIdx := e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+		parentIdx, err := e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+		if err != nil {
+			return err
+		}
 		isDir := (m.Flags & FlagDir) != 0
 
 		var nodeID uint32
@@ -535,18 +671,12 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 
 		extID := e.extPool.InternFromName(m.Name, isDir)
 		e.mem.Upsert(nodeID, m.VolID, m.NodeKey, parentIdx, m.Name, m.Flags, extID, m.Size, m.ModTime)
-		if isDir {
-			e.dirByKey.Put(m.VolID, m.NodeKey, nodeID)
-		} else {
-			e.dirByKey.Delete(m.VolID, m.NodeKey)
-		}
 
 	case OpDelete:
 		nodeID, found := e.findLiveByKeyLocked(m.VolID, m.NodeKey)
 		if !found {
 			return nil
 		}
-		e.dirByKey.Delete(m.VolID, m.NodeKey)
 		e.mem.MarkDeletedByNodeID(nodeID)
 		e.markDeletedInSegmentsLocked(nodeID)
 
@@ -567,9 +697,15 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 		}
 		parentIdx := oldNode.ParentIdx
 		if m.NewParentKey != 0 {
-			parentIdx = e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+			parentIdx, err = e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+			if err != nil {
+				return err
+			}
 		} else if m.ParentKey != 0 {
-			parentIdx = e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+			parentIdx, err = e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+			if err != nil {
+				return err
+			}
 		}
 
 		isDir := (oldNode.Flags & FlagDir) != 0
@@ -591,18 +727,9 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 
 		e.markDeletedInSegmentsLocked(nodeID)
 		e.mem.Upsert(nodeID, m.VolID, m.NodeKey, parentIdx, m.Name, flags, extID, cm.Size, cm.ModTime)
-		if isDir {
-			e.dirByKey.Put(m.VolID, m.NodeKey, nodeID)
-		}
 
 	case OpMoveDir:
-		var nodeID uint32
-		var found bool
-		if id, ok := e.dirByKey.Get(m.VolID, m.NodeKey); ok {
-			nodeID, found = id, true
-		} else {
-			nodeID, found = e.findLiveByKeyLocked(m.VolID, m.NodeKey)
-		}
+		nodeID, found := e.findLiveByKeyLocked(m.VolID, m.NodeKey)
 		if !found {
 			return nil
 		}
@@ -613,10 +740,12 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 		if !ok {
 			return nil
 		}
-		newParentIdx := e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+		newParentIdx, err := e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+		if err != nil {
+			return err
+		}
 		e.markDeletedInSegmentsLocked(nodeID)
 		e.mem.Upsert(nodeID, m.VolID, m.NodeKey, newParentIdx, oldName, oldNode.Flags|FlagDir, oldNode.ExtID, oldCold.Size, oldCold.ModTime)
-		e.dirByKey.Put(m.VolID, m.NodeKey, nodeID)
 
 	case OpCursorUpdate:
 		e.manifest.SetVolumeCursor(VolumeCursor{
@@ -634,14 +763,28 @@ func (e *Engine) allocNodeIDLocked() uint32 {
 	return id
 }
 
-func (e *Engine) resolveParentIdxLocked(volID uint16, parentKey, selfKey uint64) uint32 {
+// ErrParentNotFound reports a mutation whose parent directory is absent from
+// the index, so the node must not be silently attached to the volume root.
+var ErrParentNotFound = errors.New("storage: parent directory not found")
+
+// resolveParentIdxLocked maps a parent directory key to its NodeID by looking
+// up the live node and verifying it is a directory. The mapping is never cached
+// in a process-wide table, so resident memory stays independent of dir count.
+func (e *Engine) resolveParentIdxLocked(volID uint16, parentKey, selfKey uint64) (uint32, error) {
 	if parentKey == 0 || parentKey == selfKey {
-		return RootParentIdx
+		return RootParentIdx, nil
 	}
-	if dirID, ok := e.dirByKey.Get(volID, parentKey); ok {
-		return dirID
+	nodeID, node, _, _, ok, err := e.findLiveFullByKeyLocked(volID, parentKey)
+	if err != nil {
+		return 0, err
 	}
-	return RootParentIdx
+	if !ok {
+		return 0, fmt.Errorf("%w: vol %d key %d", ErrParentNotFound, volID, parentKey)
+	}
+	if (node.Flags & FlagDir) == 0 {
+		return 0, fmt.Errorf("%w: vol %d key %d is not a directory", ErrParentNotFound, volID, parentKey)
+	}
+	return nodeID, nil
 }
 
 func (e *Engine) findLiveByKeyLocked(volID uint16, nodeKey uint64) (uint32, bool) {
@@ -696,6 +839,22 @@ func (e *Engine) findLiveFullByNodeIDLocked(nodeID uint32) (HotNode, string, Col
 		}
 	}
 	return HotNode{}, "", ColdMeta{}, false, nil
+}
+
+// DirMapLimit is the resident budget for directory-id resolution structures.
+const DirMapLimit int64 = 32 << 20
+
+// DirMapBytes reports the resident bytes used by directory-id resolution.
+// Sorted dirs.col lookups hold no per-entry memory, so this stays at zero unless
+// an older unsorted segment needed its lazy fallback map.
+func (e *Engine) DirMapBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	var total int64
+	for _, s := range e.segments {
+		total += s.dirIdxBytes()
+	}
+	return total
 }
 
 func (e *Engine) markDeletedInSegmentsLocked(nodeID uint32) {
@@ -804,6 +963,7 @@ func (e *Engine) flushLocked() error {
 		if err != nil {
 			return err
 		}
+		builder.setBuildBudget(e.opts.BuildBudgetBytes)
 		for i := range rows {
 			r := rows[i]
 			if err := builder.Append(r.nodeID, r.volID, r.nodeKey, r.parentIdx, r.name, r.flags, r.extID, r.size, r.modTime); err != nil {
@@ -945,7 +1105,6 @@ func (e *Engine) compactLocked() error {
 		oldSegs := e.segments
 		e.segments = nil
 		e.manifest = nextManifest
-		e.dirByKey.Clear()
 		e.resetMemLocked()
 		for _, s := range oldSegs {
 			s.MarkForRemoval()
@@ -992,8 +1151,7 @@ func (e *Engine) compactLocked() error {
 	if err != nil {
 		return err
 	}
-	newDirByKey := NewKeyMap(max(e.dirByKey.Len(), 64))
-
+	builder.setBuildBudget(e.opts.BuildBudgetBytes)
 	remapParent := func(oldParent uint32) uint32 {
 		if oldParent == RootParentIdx {
 			return RootParentIdx
@@ -1028,7 +1186,7 @@ func (e *Engine) compactLocked() error {
 			if !okOverride {
 				cm = diskCold
 			}
-			assignedID, err := builder.AppendDense(
+			_, err := builder.AppendDense(
 				n.VolID,
 				keys[localIdx],
 				remapParent(n.ParentIdx),
@@ -1043,9 +1201,6 @@ func (e *Engine) compactLocked() error {
 				builder.Abort()
 				return err
 			}
-			if (n.Flags & FlagDir) != 0 {
-				newDirByKey.Put(n.VolID, keys[localIdx], assignedID)
-			}
 		}
 		cs.Close()
 	}
@@ -1055,7 +1210,7 @@ func (e *Engine) compactLocked() error {
 		slot, _ := e.mem.GetByNodeID(nodeID)
 		cm := e.mem.ColdMetaAt(slot)
 		nk := e.mem.KeyAt(slot)
-		assignedID, err := builder.AppendDense(
+		_, err := builder.AppendDense(
 			n.VolID,
 			nk,
 			remapParent(n.ParentIdx),
@@ -1068,9 +1223,6 @@ func (e *Engine) compactLocked() error {
 		if err != nil {
 			memErr = err
 			return false
-		}
-		if (n.Flags & FlagDir) != 0 {
-			newDirByKey.Put(n.VolID, nk, assignedID)
 		}
 		return true
 	})
@@ -1112,7 +1264,6 @@ func (e *Engine) compactLocked() error {
 	// Post-commit: switch live engine state, release old segments, then rotate WAL.
 	oldSegs := e.segments
 	e.segments = []*Segment{newSeg}
-	e.dirByKey = newDirByKey
 	e.manifest = nextManifest
 	e.writeGen++
 	e.resetMemLocked()
@@ -1201,6 +1352,7 @@ func (e *Engine) CompactOldest(n int) error {
 		releasePins()
 		return err
 	}
+	builder.setBuildBudget(e.opts.BuildBudgetBytes)
 	abortBuild := func() {
 		builder.Abort()
 		_ = os.RemoveAll(segPath)
@@ -1344,24 +1496,9 @@ func (e *Engine) CompactOldest(n int) error {
 		}
 	}
 
-	newDirByKey := NewKeyMap(max(e.dirByKey.Len(), 64))
 	remaining := make([]*Segment, 0, len(cur)-n+1)
 	remaining = append(remaining, newSeg)
 	remaining = append(remaining, cur[n:]...)
-	for _, s := range remaining {
-		if err := s.PopulateDirMap(newDirByKey); err != nil {
-			newSeg.MarkForRemoval()
-			releasePins()
-			return err
-		}
-	}
-	e.mem.ForEachLive(func(nodeID uint32, node HotNode, _ []byte) bool {
-		slot, _ := e.mem.GetByNodeID(nodeID)
-		if (node.Flags & FlagDir) != 0 {
-			newDirByKey.Put(node.VolID, e.mem.KeyAt(slot), nodeID)
-		}
-		return true
-	})
 
 	nextManifest := e.manifest.Clone()
 	nextManifest.WALGeneration++
@@ -1382,7 +1519,6 @@ func (e *Engine) CompactOldest(n int) error {
 
 	// Post-commit: switch engine state, then release the merged segments.
 	e.segments = remaining
-	e.dirByKey = newDirByKey
 	e.manifest = nextManifest
 	if useTier2 {
 		e.tier2Sticky = true

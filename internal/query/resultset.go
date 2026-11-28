@@ -33,6 +33,7 @@ type ResultSet struct {
 	plan        *compiledPlan
 	pathSep     byte
 	total       int
+	truncated   bool
 	rows        []rankedRow
 	foldedItems []ResultItem
 	isFolded    bool
@@ -62,9 +63,11 @@ func (rs *ResultSet) Retained() int {
 	return len(rs.rows)
 }
 
-// Truncated reports whether Total exceeded MaxRetained and results were capped to Top-K.
+// Truncated reports whether the result set is incomplete: either the candidate
+// budget was exhausted (Total is then a lower bound) or Total exceeded the
+// retained Top-K rows.
 func (rs *ResultSet) Truncated() bool {
-	return rs.total > rs.Retained()
+	return rs.truncated || rs.total > rs.Retained()
 }
 
 // Cost returns the elapsed duration of the Start phase (parse + scan + rank).
@@ -207,7 +210,7 @@ func (rs *ResultSet) Viewport(ctx context.Context, offset, limit int) ([]ResultI
 // toSearchResult builds a legacy SearchResult from a ResultSet and a materialized viewport slice.
 func (rs *ResultSet) toSearchResult(items []ResultItem, offset, limit int, start time.Time) *SearchResult {
 	cost := time.Since(start)
-	return &SearchResult{
+	res := &SearchResult{
 		Query:       rs.query,
 		Total:       rs.total,
 		Returned:    len(items),
@@ -219,7 +222,12 @@ func (rs *ResultSet) toSearchResult(items []ResultItem, offset, limit int, start
 		ColdReads:   rs.ColdReads(),
 		Warnings:    rs.warnings,
 		Items:       items,
+		Truncated:   rs.Truncated(),
 	}
+	if rs.truncated {
+		res.TotalLowerBound = rs.total
+	}
+	return res
 }
 
 // selectTopK places the k smallest elements (according to cmp) in items[:k] in sorted order

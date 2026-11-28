@@ -164,7 +164,8 @@ func scanInvertedSegment(
 	ss storage.SegmentSnapshot,
 	plan *compiledPlan,
 	localCold *int64,
-) ([]candidate, error) {
+	col *lockedCollector,
+) error {
 	views := make([]*atomViews, 0, len(plan.requiredNames))
 	for _, ca := range plan.requiredNames {
 		if ca.needleRunes < minInvertedRunes {
@@ -172,18 +173,18 @@ func scanInvertedSegment(
 		}
 		av, err := buildAtomViews(ss, ca)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if av == nil {
 			continue
 		}
 		if !av.plausible() {
-			return nil, nil // no name in this segment can satisfy the atom
+			return nil // no name in this segment can satisfy the atom
 		}
 		views = append(views, av)
 	}
 	if len(views) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	src := 0
@@ -194,15 +195,19 @@ func scanInvertedSegment(
 	}
 	srcViews := views[src].mostSelective()
 
-	var out []candidate
 	var ctxErr error
+	scanned := 0
 	lsm.IntersectAll(srcViews, func(localIdx uint32) bool {
-		if len(out)&ctxCheckIntervalMask == 0 {
+		if scanned&ctxCheckIntervalMask == 0 {
 			if err := ctx.Err(); err != nil {
 				ctxErr = err
 				return false
 			}
+			if col.done() {
+				return false
+			}
 		}
+		scanned++
 		if localIdx >= ss.Count() {
 			return true
 		}
@@ -247,14 +252,14 @@ func scanInvertedSegment(
 				cand.size = ec.coldMeta.Size
 				cand.modTime = ec.coldMeta.ModTime
 			}
-			out = append(out, cand)
+			col.add(cand)
 		}
 		return true
 	})
 	if ctxErr != nil {
-		return nil, ctxErr
+		return ctxErr
 	}
-	return out, nil
+	return nil
 }
 
 // memInvertedCandidates returns MemTable nodeIDs that satisfy every long name

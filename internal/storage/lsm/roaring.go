@@ -116,6 +116,19 @@ func (b *RoaringBuilder) closeContainer() {
 	}
 }
 
+// Spill returns the containers completed so far and releases that buffer,
+// keeping the open container and ordering state intact. Because container keys
+// only move forward, concatenating spills in order reproduces the exact stream
+// Finish would have produced.
+func (b *RoaringBuilder) Spill() []byte {
+	if b.fin {
+		return nil
+	}
+	out := b.buf
+	b.buf = nil
+	return out
+}
+
 // Finish closes the final container and returns the serialized Roaring stream
 // plus the total cardinality. The builder must not be used afterwards.
 func (b *RoaringBuilder) Finish() ([]byte, uint64) {

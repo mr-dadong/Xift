@@ -68,7 +68,8 @@ func scanShortWordSegment(
 	ss storage.SegmentSnapshot,
 	plan *compiledPlan,
 	localCold *int64,
-) (cands []candidate, ok bool, partial bool, err error) {
+	col *lockedCollector,
+) (ok bool, partial bool, err error) {
 	var atom *compiledAtom
 	for i := range plan.requiredNames {
 		ca := &plan.requiredNames[i]
@@ -78,12 +79,12 @@ func scanShortWordSegment(
 		}
 	}
 	if atom == nil {
-		return nil, false, false, nil // no 2-rune ASCII term: sequential fallback
+		return false, false, nil // no 2-rune ASCII term: sequential fallback
 	}
 
 	_, bi := ss.Tier2Indexes()
 	if bi == nil {
-		return nil, false, false, nil
+		return false, false, nil
 	}
 	segID := ss.SegmentID()
 
@@ -100,24 +101,24 @@ func scanShortWordSegment(
 
 	normalViews, normalState, err := loadShortPath(bi, segID, normal)
 	if err != nil {
-		return nil, false, false, err
+		return false, false, err
 	}
 	var pinyinState shortPathState
 	var pinyinViews []*lsm.RoaringView
 	if len(pinyin) > 0 {
 		pinyinViews, pinyinState, err = loadShortPath(bi, segID, pinyin)
 		if err != nil {
-			return nil, false, false, err
+			return false, false, err
 		}
 	}
 
 	// A cut path (df budget) cannot prove the hit set is complete, so fall back
 	// to the sequential scan. With both paths absent, no name can match.
 	if normalState == shortCut || pinyinState == shortCut {
-		return nil, false, false, nil
+		return false, false, nil
 	}
 	if normalState != shortOK && pinyinState != shortOK {
-		return nil, true, false, nil
+		return true, false, nil
 	}
 	views := make([]*lsm.RoaringView, 0, len(normalViews)+len(pinyinViews))
 	if normalState == shortOK {
@@ -174,14 +175,19 @@ func scanShortWordSegment(
 		return true
 	})
 	if ctxErr != nil {
-		return nil, false, false, ctxErr
+		return false, false, ctxErr
 	}
 	if truncated {
 		for i := range out {
 			out[i].partial = true
 		}
 	}
-	return out, true, truncated, nil
+	for i := range out {
+		if !col.add(out[i]) {
+			break
+		}
+	}
+	return true, truncated, nil
 }
 
 // unionIterate visits the union of the given views in ascending local-index

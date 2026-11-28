@@ -101,6 +101,8 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 	var cands []candidate
 	var coldReads int
 	partial := false
+	truncated := false
+	verified := 0
 	incremental := false
 
 	// Session incremental narrowing has the highest routing priority; the
@@ -112,19 +114,23 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 			snap.Release()
 			return nil, err
 		}
+		verified = len(cands)
 		incremental = true
 	} else {
-		cands, coldReads, partial, err = scanSnapshot(runCtx, snap, plan, opts.Workers)
-		if err != nil {
+		out, scanErr := scanSnapshot(runCtx, snap, plan, opts.Workers, opts.CandidateBudget)
+		if scanErr != nil {
 			snap.Release()
-			return nil, err
+			return nil, scanErr
 		}
+		cands, coldReads, partial = out.cands, out.coldReads, out.partial
+		truncated, verified = out.truncated, out.verified
 	}
 
 	// Store compact candidate snapshot for next incremental keystroke if within
-	// budget. Truncated short-word results are partial and must not seed the
-	// next keystroke, or the 2->3 rune transition could miss hits.
-	if len(cands) <= maxCachedSessionCandidates && !partial && !containsPartialCandidates(cands) {
+	// budget. Truncated results (short-word path or candidate budget) are
+	// incomplete and must not seed the next keystroke, or the 2->3 rune
+	// transition could miss hits.
+	if len(cands) <= maxCachedSessionCandidates && !partial && !truncated && !containsPartialCandidates(cands) {
 		cacheCopy := make([]candidate, len(cands))
 		copy(cacheCopy, cands)
 		s.mu.Lock()
@@ -144,7 +150,7 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 		s.mu.Unlock()
 	}
 
-	rs, err := s.engine.rankCandidates(runCtx, snap, q, plan, cands, coldReads, incremental, opts, start)
+	rs, err := s.engine.rankCandidates(runCtx, snap, q, plan, cands, coldReads, incremental, opts, start, truncated, verified)
 	if err != nil {
 		snap.Release()
 		return nil, err

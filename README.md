@@ -100,15 +100,15 @@ Below 5M files: `mmap` columns. Above that: an LSM + Trigram engine behind a **f
 
 | Metric | Result |
 | :--- | ---: |
-| Build 1.1M nodes (Dense Tier 2 segment) | **2.89 s** |
+| Build 1.1M nodes (Dense Tier 2 segment) | **2.92 s** |
 | Index size on disk | **120.8 MiB** |
-| Cold start (reopen) | **4.8 ms** |
+| Cold start (reopen) | **1.5 ms** |
 | Selective query p50 / p95 | **< 0.01 ms / 1.5 ms** |
-| Wide-match synthetic query p50 | **106 ms** (≈100k hits, full ranking — see note) |
-| Query-time RSS with a 128 MB cache | **99.5 MiB** |
-| Build peak RSS | **462 MiB** |
+| Wide-match synthetic query p50 / p95 | **4.9 / 6.1 ms** (≈100k hits, bounded Top-K) |
+| Query-time RSS (96 MiB cache cap) | **28.9 MiB** |
+| Build peak RSS | **463 MiB** |
 
-> The wide-match number is a deliberately adversarial synthetic corpus where 10% of all names share one token; realistic selective terms stay in the sub-millisecond range.
+> The wide-match number is a deliberately adversarial synthetic corpus where 10% of all names share one token; Tier 2 bounds wide matches with Top-K and flags them `truncated`.
 
 ### 🎯 Design SLAs
 
@@ -173,7 +173,11 @@ Moving a directory with **500,000 children** means rewriting **one `uint32`**. D
 
 ### 🗄️ Tier 2 storage (≥ 5M live nodes)
 
-Above 5M live nodes (or in low-memory mode) new segments switch to the Tier 2 layout: trigram/bigram inverted sidecars (pinyin-initials indexed in a separate namespace), front-coded name blocks, and **block-cache-only reads** — no whole-file `mmap`, so resident memory is bounded by the 128 MB sharded LRU cache regardless of index size. Live changes only touch the MemTable and tombstone bits; a low-priority background worker rebuilds Tier 1 segments into Tier 2 and merges the oldest segments once there are more than eight. Fuzzy (discrete-subsequence) matching is intentionally Tier 1 only: trigram postings cannot bound it without a scan.
+Above 5M live nodes (or in low-memory mode) new segments switch to the Tier 2 layout: trigram/bigram inverted sidecars (pinyin-initials indexed in a separate namespace), front-coded name blocks, and **block-cache-only reads** — no whole-file `mmap`, so resident memory is bounded by the 96 MiB sharded LRU cache (default, configurable) regardless of index size. Live changes only touch the MemTable and tombstone bits; a low-priority background worker rebuilds Tier 1 segments into Tier 2 and merges the oldest segments once there are more than eight. Fuzzy (discrete-subsequence) matching is intentionally Tier 1 only: trigram postings cannot bound it without a scan.
+
+Build memory is bounded too: `BuildBudgetBytes` (2 GiB by default) caps one segment's build state — names spill to fold-sorted runs and inverted postings spill per gram, both merged at finish. Volumes above `DenseSegmentNodes` (10M by default) are committed as multiple segments, and tiered compaction only kicks in past 32 segments or 4 GiB of committed segments.
+
+Tier 2 interactive queries use **bounded Top-K**: at most 8192 matches are verified by default (`SearchOptions.CandidateBudget`). Beyond that the result is flagged `Truncated` and `Total` degrades to a confirmed-hit lower bound; call `Engine.Count` when an exact total is required (it ignores the budget and may be slower). Tier 1 scans in-memory/`mmap` columns in full, so its semantics are unchanged.
 
 ### 🌪️ Storm-proof event pipeline
 

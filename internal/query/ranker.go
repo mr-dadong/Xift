@@ -24,8 +24,13 @@ func (e *Engine) rankCandidates(
 	incremental bool,
 	opts SearchOptions,
 	start time.Time,
+	truncated bool,
+	verified int,
 ) (*ResultSet, error) {
 	total := len(cands)
+	if verified > total {
+		total = verified
+	}
 	if total == 0 {
 		snap.Release()
 		rs := &ResultSet{
@@ -36,6 +41,7 @@ func (e *Engine) rankCandidates(
 			cost:        time.Since(start),
 			incremental: incremental,
 			warnings:    q.Warnings,
+			truncated:   truncated,
 		}
 		rs.coldReads.Store(int64(coldReads))
 		return rs, nil
@@ -212,6 +218,7 @@ func (e *Engine) rankCandidates(
 		cost:        time.Since(start),
 		incremental: incremental,
 		warnings:    q.Warnings,
+		truncated:   truncated,
 	}
 	rs.coldReads.Store(int64(coldReads))
 	return rs, nil

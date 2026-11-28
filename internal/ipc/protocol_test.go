@@ -134,6 +134,32 @@ func TestProtocolAllMessagesRoundTrip(t *testing.T) {
 	}
 }
 
+// TestQueryResultMetaBudgetTruncation verifies the existing Truncated bit carries
+// budget truncation with Total as the lower bound, and that the frame layout
+// stays byte-stable so older clients keep decoding new daemons' frames.
+func TestQueryResultMetaBudgetTruncation(t *testing.T) {
+	msg := &QueryResultMeta{SessionID: 7, Total: 8192, Retained: 100, Truncated: true}
+	msgType, payload, err := EncodeMessage(msg)
+	if err != nil {
+		t.Fatalf("EncodeMessage: %v", err)
+	}
+	if msgType != MsgQueryResultMeta {
+		t.Fatalf("type = %v, want %v", msgType, MsgQueryResultMeta)
+	}
+	// sid(8) + total(8) + retained(4) + cost(4) + flags(2) + warning count(1).
+	if want := 27; len(payload) != want {
+		t.Fatalf("payload = %d bytes, want %d (no new field may be appended)", len(payload), want)
+	}
+	got, err := DecodeMessage(msgType, payload)
+	if err != nil {
+		t.Fatalf("DecodeMessage: %v", err)
+	}
+	meta, ok := got.(*QueryResultMeta)
+	if !ok || !meta.Truncated || meta.Total != 8192 {
+		t.Fatalf("decoded = %#v, want truncated meta with lower bound 8192", got)
+	}
+}
+
 func TestProtocolMalformedFramesRejected(t *testing.T) {
 	t.Run("BadMagic", func(t *testing.T) {
 		var hdr [FrameHeaderSize]byte

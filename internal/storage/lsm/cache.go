@@ -7,7 +7,7 @@ import (
 
 // DefaultBlockCacheBytes is the default hard byte budget of the Tier 2 block
 // cache (architecture rule 4: fixed-budget LRU block cache, default 128 MB).
-const DefaultBlockCacheBytes = 128 << 20
+const DefaultBlockCacheBytes = 96 << 20
 
 // blockCacheShards is the sharding factor; each shard owns limit/shards bytes,
 // so the sum over shards never exceeds the total budget.
@@ -24,6 +24,7 @@ const (
 	BlockKindHot                           // hot.col record block (Tier 2)
 	BlockKindKeys                          // keys.idx record block (Tier 2)
 	BlockKindNodeIDs                       // nodeids.col record block (Tier 2)
+	BlockKindDirs                          // dirs.col record block (sorted directory index)
 )
 
 var (

@@ -368,26 +368,74 @@ func evalAtom(ca *compiledAtom, ec *evalContext) (bool, MatchTier) {
 	}
 }
 
-// scanSnapshot performs lock-free multi-core sharded hot-column scanning over all segments
-// and MemTable in snap.
-func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPlan, workers int) (cands []candidate, coldReads int, partial bool, err error) {
-	if err := ctx.Err(); err != nil {
-		return nil, 0, false, err
-	}
+// scanOutcome is what one snapshot scan produced under a candidate budget.
+type scanOutcome struct {
+	cands     []candidate
+	coldReads int
+	// partial marks results from a truncated short-word path (incomplete low-df
+	// bigram coverage); such sets must not seed session narrowing.
+	partial bool
+	// truncated marks that the candidate budget was exhausted, so the match set
+	// may contain more entries than were verified.
+	truncated bool
+	// verified counts accepted matches. When truncated it is a lower bound.
+	verified int
+}
 
-	var allCands []candidate
-	var totalCold atomic.Int64
-	partial = false
+// lockedCollector serializes candidate collection across parallel scan shards.
+type lockedCollector struct {
+	mu  sync.Mutex
+	col *candidateCollector
+}
+
+func newLockedCollector(budget int) *lockedCollector {
+	return &lockedCollector{col: newCandidateCollector(budget)}
+}
+
+func (l *lockedCollector) add(c candidate) bool {
+	l.mu.Lock()
+	ok := l.col.add(c)
+	l.mu.Unlock()
+	return ok
+}
+
+func (l *lockedCollector) done() bool {
+	l.mu.Lock()
+	d := l.col.done()
+	l.mu.Unlock()
+	return d
+}
+
+// scanSnapshot performs lock-free multi-core sharded hot-column scanning over all segments
+// and MemTable in snap, verifying at most budget matches (Tier 2 only; Tier 1 keeps
+// exact in-memory semantics with an unbounded budget).
+func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPlan, workers, budget int) (scanOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return scanOutcome{}, err
+	}
 
 	// Tier 2 mode deliberately omits the Fuzzy fallback: trigram candidates are
 	// complete for substring and Pinyin hits but cannot cover Fuzzy-only hits,
 	// so matching semantics are held constant across the whole query.
 	noFuzzy := snapshotTier2Mode(snap)
 
+	// Tier 1 scans immutable in-memory or mmap'd columns, so full materialization
+	// stays cheap and bounded by the 5M-node tier ceiling; the budget exists to
+	// bound Tier 2's per-match block reads.
+	if !noFuzzy {
+		budget = 0
+	}
+	col := newLockedCollector(budget)
+	var totalCold atomic.Int64
+	partial := false
+
 	segCount := snap.SegmentCount()
 	for si := 0; si < segCount; si++ {
 		if err := ctx.Err(); err != nil {
-			return nil, int(totalCold.Load()), false, err
+			return scanOutcome{}, err
+		}
+		if col.done() {
+			break
 		}
 		ss := snap.SegmentSnapshotAt(si)
 		n := ss.Count()
@@ -397,38 +445,35 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 
 		if ss.IsTier2() {
 			var localCold int64
-			var cands []candidate
 			var err error
 			switch routeSegment(plan, ss) {
 			case routeInverted:
-				cands, err = scanInvertedSegment(ctx, snap, ss, plan, &localCold)
+				err = scanInvertedSegment(ctx, snap, ss, plan, &localCold, col)
 			case routeShortWord:
 				var ok, segPartial bool
-				cands, ok, segPartial, err = scanShortWordSegment(ctx, snap, ss, plan, &localCold)
+				ok, segPartial, err = scanShortWordSegment(ctx, snap, ss, plan, &localCold, col)
 				if err == nil && !ok {
-					cands, err = scanSegmentRangeTier2(ctx, snap, ss, plan, 0, n, &localCold)
+					err = scanSegmentRangeTier2(ctx, snap, ss, plan, 0, n, &localCold, col)
 				} else if segPartial {
 					partial = true
 				}
 			default:
-				cands, err = scanSegmentRangeTier2(ctx, snap, ss, plan, 0, n, &localCold)
+				err = scanSegmentRangeTier2(ctx, snap, ss, plan, 0, n, &localCold, col)
 			}
 			totalCold.Add(localCold)
 			if err != nil {
-				return nil, int(totalCold.Load()), false, err
+				return scanOutcome{}, err
 			}
-			allCands = append(allCands, cands...)
 			continue
 		}
 
 		if workers <= 1 || n < minParallelShardSize {
 			var localCold int64
-			cands, err := scanSegmentRange(ctx, snap, ss, plan, 0, n, noFuzzy, &localCold)
+			err := scanSegmentRange(ctx, snap, ss, plan, 0, n, noFuzzy, &localCold, col)
 			totalCold.Add(localCold)
 			if err != nil {
-				return nil, int(totalCold.Load()), false, err
+				return scanOutcome{}, err
 			}
-			allCands = append(allCands, cands...)
 			continue
 		}
 
@@ -439,7 +484,6 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 			wCount = int((n + shardSize - 1) / shardSize)
 		}
 
-		results := make([][]candidate, wCount)
 		errs := make([]error, wCount)
 		var wg sync.WaitGroup
 		for w := 0; w < wCount; w++ {
@@ -455,39 +499,25 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 			go func(idx int, lo, hi uint32) {
 				defer wg.Done()
 				var localCold int64
-				c, err := scanSegmentRange(ctx, snap, ss, plan, lo, hi, noFuzzy, &localCold)
+				errs[idx] = scanSegmentRange(ctx, snap, ss, plan, lo, hi, noFuzzy, &localCold, col)
 				totalCold.Add(localCold)
-				results[idx] = c
-				errs[idx] = err
 			}(w, start, end)
 		}
 		wg.Wait()
 
 		for i := 0; i < wCount; i++ {
 			if errs[i] != nil {
-				return nil, int(totalCold.Load()), false, errs[i]
+				return scanOutcome{}, errs[i]
 			}
-		}
-		totalLen := len(allCands)
-		for i := 0; i < wCount; i++ {
-			totalLen += len(results[i])
-		}
-		if cap(allCands) < totalLen {
-			grown := make([]candidate, len(allCands), totalLen)
-			copy(grown, allCands)
-			allCands = grown
-		}
-		for i := 0; i < wCount; i++ {
-			allCands = append(allCands, results[i]...)
 		}
 	}
 
 	// Scan MemTable (typically small, <= 64K entries). In Tier 2 mode the
 	// in-memory inverted map prunes candidates first; otherwise every live
 	// slot is evaluated.
-	if mem := snap.MemTable(); mem != nil && mem.LiveCount() > 0 {
+	if mem := snap.MemTable(); mem != nil && mem.LiveCount() > 0 && !col.done() {
 		if err := ctx.Err(); err != nil {
-			return nil, int(totalCold.Load()), false, err
+			return scanOutcome{}, err
 		}
 		var localCold int64
 		emit := func(slot uint32) bool {
@@ -521,7 +551,7 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 					cand.size = ec.coldMeta.Size
 					cand.modTime = ec.coldMeta.ModTime
 				}
-				allCands = append(allCands, cand)
+				col.add(cand)
 			}
 			return true
 		}
@@ -538,7 +568,10 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 				if (i & ctxCheckIntervalMask) == 0 {
 					if err := ctx.Err(); err != nil {
 						totalCold.Add(localCold)
-						return nil, int(totalCold.Load()), false, err
+						return scanOutcome{}, err
+					}
+					if col.done() {
+						break
 					}
 				}
 				if slot, ok := mem.GetByNodeID(nodeID); ok {
@@ -551,7 +584,10 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 				if (i & ctxCheckIntervalMask) == 0 {
 					if err := ctx.Err(); err != nil {
 						totalCold.Add(localCold)
-						return nil, int(totalCold.Load()), false, err
+						return scanOutcome{}, err
+					}
+					if col.done() {
+						break
 					}
 				}
 				emit(uint32(i))
@@ -560,7 +596,13 @@ func scanSnapshot(ctx context.Context, snap *storage.Snapshot, plan *compiledPla
 		totalCold.Add(localCold)
 	}
 
-	return allCands, int(totalCold.Load()), partial, nil
+	return scanOutcome{
+		cands:     col.col.results(),
+		coldReads: int(totalCold.Load()),
+		partial:   partial,
+		truncated: col.col.truncated(),
+		verified:  col.col.verified(),
+	}, nil
 }
 
 // snapshotTier2Mode reports whether the engine was in Tier 2 mode for snap.
@@ -577,12 +619,15 @@ func scanSegmentRangeTier2(
 	plan *compiledPlan,
 	start, end uint32,
 	localCold *int64,
-) ([]candidate, error) {
-	var out []candidate
+	col *lockedCollector,
+) error {
 	for i := start; i < end; i++ {
 		if (i & ctxCheckIntervalMask) == 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return err
+			}
+			if col.done() {
+				return nil
 			}
 		}
 		if ss.IsDeleted(i) {
@@ -618,10 +663,10 @@ func scanSegmentRangeTier2(
 				cand.size = ec.coldMeta.Size
 				cand.modTime = ec.coldMeta.ModTime
 			}
-			out = append(out, cand)
+			col.add(cand)
 		}
 	}
-	return out, nil
+	return nil
 }
 
 func scanSegmentRange(
@@ -632,17 +677,20 @@ func scanSegmentRange(
 	start, end uint32,
 	noFuzzy bool,
 	localCold *int64,
-) ([]candidate, error) {
+	col *lockedCollector,
+) error {
 	nodes := ss.HotNodes()
 	names := ss.NamesBytes()
 	namesLen := uint64(len(names))
 	root := plan.root
 
-	var out []candidate
 	for i := start; i < end; i++ {
 		if (i & ctxCheckIntervalMask) == 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return err
+			}
+			if col.done() {
+				return nil
 			}
 		}
 		if ss.IsDeleted(i) {
@@ -681,8 +729,8 @@ func scanSegmentRange(
 				cand.size = ec.coldMeta.Size
 				cand.modTime = ec.coldMeta.ModTime
 			}
-			out = append(out, cand)
+			col.add(cand)
 		}
 	}
-	return out, nil
+	return nil
 }

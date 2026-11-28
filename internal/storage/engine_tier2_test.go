@@ -841,13 +841,28 @@ func TestTieredCompactionAutoTrigger(t *testing.T) {
 	}
 	defer func() { _ = eng.Close() }()
 
-	flushTieredSegments(t, eng, tieredCompactionNodes())
+	// One segment per batch: 1 dir batch + 32 single-file batches crosses the
+	// 32-segment threshold, so the worker merges the oldest 8 into one.
+	const files = 32
+	batches := make([][]tierSwitchNode, 0, files+1)
+	batches = append(batches, []tierSwitchNode{
+		{nodeKey: 1, name: "root", isDir: true, mtime: 1},
+		{nodeKey: 2, name: "dirA", isDir: true, mtime: 2},
+	})
+	for i := 0; i < files; i++ {
+		key := uint64(10 + i)
+		batches = append(batches, []tierSwitchNode{
+			{nodeKey: key, name: fmt.Sprintf("seg_%02d_file.txt", i), size: int64(key), mtime: int64(key)},
+		})
+	}
+	flushTieredSegments(t, eng, batches)
 
-	// Cross the threshold and let the background worker merge the oldest 8.
-	deadline := time.Now().Add(10 * time.Second)
+	wantSegs := files + 1 - tier2CompactionBatch + 1
+	wantLive := 2 + files
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		segs := engineSegmentMetas(eng)
-		if len(segs) == 2 {
+		if len(segs) == wantSegs {
 			for _, sm := range segs {
 				if !sm.Tier2 {
 					t.Fatalf("auto-merged layout must stay Tier 2: %+v", segs)
@@ -855,8 +870,8 @@ func TestTieredCompactionAutoTrigger(t *testing.T) {
 			}
 			// The merge must preserve every live node.
 			live := liveView(t, eng)
-			if len(live) != 10 {
-				t.Fatalf("post-merge live nodes = %d, want 10", len(live))
+			if len(live) != wantLive {
+				t.Fatalf("post-merge live nodes = %d, want %d", len(live), wantLive)
 			}
 			return
 		}
