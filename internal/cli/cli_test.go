@@ -18,6 +18,7 @@ import (
 	"github.com/mr-dadong/Xift/internal/daemon"
 	"github.com/mr-dadong/Xift/internal/query"
 	"github.com/mr-dadong/Xift/internal/storage"
+	"github.com/mr-dadong/Xift/internal/storage/lsm"
 )
 
 func TestCLIEndToEndIndexSearchJSONPipeAndFoldedIn(t *testing.T) {
@@ -69,6 +70,12 @@ func TestCLIEndToEndIndexSearchJSONPipeAndFoldedIn(t *testing.T) {
 	}
 	if status.LiveCount == 0 || status.RecommendedTier != "tier1-mmap" {
 		t.Fatalf("unexpected status: %+v", status)
+	}
+	if status.ActiveTier != "tier1-mmap" {
+		t.Fatalf("active tier = %q, want tier1-mmap", status.ActiveTier)
+	}
+	if want := int64(lsm.DefaultBlockCacheBytes); status.BlockCacheLimit != want {
+		t.Fatalf("block cache limit = %d, want default %d", status.BlockCacheLimit, want)
 	}
 
 	// 3. Default pipe mode: one path per line, no decoration.

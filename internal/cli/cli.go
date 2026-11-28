@@ -20,7 +20,10 @@ type StatusOutput struct {
 	DataDir         string  `json:"data_dir"`
 	LiveCount       uint64  `json:"live_count"`
 	MemTableEntries int     `json:"memtable_entries"`
+	ActiveTier      string  `json:"active_tier"`
 	RecommendedTier string  `json:"recommended_tier"`
+	BlockCacheBytes int64   `json:"block_cache_bytes"`
+	BlockCacheLimit int64   `json:"block_cache_limit_bytes"`
 	OpenMs          float64 `json:"open_ms"`
 }
 
@@ -41,6 +44,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 			return runIndex(ctx, args[1:], stdout, stderr)
 		case "status":
 			return runStatus(ctx, args[1:], stdout, stderr)
+		case "snapshot":
+			return runSnapshot(ctx, args[1:], stdout, stderr)
+		case "l2":
+			return runL2(ctx, args[1:], stdout, stderr)
 		case "search":
 			return runSearch(ctx, args[1:], stdout, stderr)
 		case "-h", "--help", "help":
@@ -63,6 +70,9 @@ Usage:
   xift index [flags] [dir...]         Build/update read-only local Tier 1 index
                                       (Note: do not run xift index while xift-daemon is running)
   xift status [flags]                 Display index or Daemon statistics
+  xift snapshot export|import|list|remove
+                                      Export/import/mount read-only volume snapshots
+  xift l2 add|remove|status           Manage the whitelisted L2 content index
 
 Query DSL examples:
   xift report 2026 ext:pdf,docx !draft
@@ -401,11 +411,15 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	defer store.Close()
 
 	st := store.OpenStats()
+	cacheUsed, cacheLimit := store.BlockCacheStats()
 	out := StatusOutput{
 		DataDir:         dataDir,
 		LiveCount:       store.LiveCount(),
 		MemTableEntries: store.MemTableEntryCount(),
+		ActiveTier:      store.ActiveTier().String(),
 		RecommendedTier: store.RecommendedTier().String(),
+		BlockCacheBytes: cacheUsed,
+		BlockCacheLimit: cacheLimit,
 		OpenMs:          float64(st.OpenDuration.Microseconds()) / 1000.0,
 	}
 
@@ -422,7 +436,9 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	fmt.Fprintf(stdout, "DataDir:          %s\n", out.DataDir)
 	fmt.Fprintf(stdout, "LiveCount:        %d\n", out.LiveCount)
 	fmt.Fprintf(stdout, "MemTableEntries:  %d\n", out.MemTableEntries)
+	fmt.Fprintf(stdout, "ActiveTier:       %s\n", out.ActiveTier)
 	fmt.Fprintf(stdout, "RecommendedTier:  %s\n", out.RecommendedTier)
+	fmt.Fprintf(stdout, "BlockCacheBytes:  %d / %d\n", out.BlockCacheBytes, out.BlockCacheLimit)
 	fmt.Fprintf(stdout, "ColdStartMs:      %.2f\n", out.OpenMs)
 	return 0
 }

@@ -1,5 +1,7 @@
 package storage
 
+import "github.com/mr-dadong/Xift/internal/storage/lsm"
+
 // SegmentSnapshot is a read-only, MVCC point-in-time view of a mounted Segment
 // paired with its snapshot-isolated tombstone bitmap. It is safe for lock-free
 // multi-core sharded scanning while concurrent writers mutate or compact the Engine.
@@ -83,4 +85,35 @@ func (ss SegmentSnapshot) IsDeleted(localIdx uint32) bool {
 		return true
 	}
 	return isBitSet(ss.delBits, ss.seg.meta.NodeCount, localIdx)
+}
+
+// IsTier2 reports whether this segment uses the Tier 2 (inverted sidecar) layout.
+func (ss SegmentSnapshot) IsTier2() bool {
+	return ss.seg != nil && ss.seg.tier2
+}
+
+// SegmentID returns the committed segment ID.
+func (ss SegmentSnapshot) SegmentID() uint32 {
+	if ss.seg == nil {
+		return 0
+	}
+	return ss.seg.meta.ID
+}
+
+// NodeAt returns the HotNode at localIdx. Tier 2 segments read through the
+// shared block cache instead of exposing a whole-column slice.
+func (ss SegmentSnapshot) NodeAt(localIdx uint32) HotNode {
+	if ss.seg == nil {
+		return HotNode{}
+	}
+	return ss.seg.NodeAt(localIdx)
+}
+
+// Tier2Indexes returns the segment's trigram and bigram inverted indexes.
+// Both are nil for Tier 1 segments.
+func (ss SegmentSnapshot) Tier2Indexes() (tri, bi *lsm.InvertedIndex) {
+	if ss.seg == nil {
+		return nil, nil
+	}
+	return ss.seg.triIdx, ss.seg.biIdx
 }

@@ -2,26 +2,284 @@ package ipc
 
 import (
 	"context"
+	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/mr-dadong/Xift/internal/filter"
 	"github.com/mr-dadong/Xift/internal/query"
 	"github.com/mr-dadong/Xift/internal/storage"
 )
+
+// QueryBackendOption customizes optional governance and Frecency extensions on QueryBackend.
+type QueryBackendOption func(*QueryBackend)
+
+// WithFrecencyStore attaches a persistent FrecencyStore to handle RecordOpen RPCs.
+func WithFrecencyStore(fs *query.FrecencyStore) QueryBackendOption {
+	return func(b *QueryBackend) {
+		b.frecency = fs
+	}
+}
+
+// WithPruner attaches a filter.Pruner and rules persistence path to handle ApplyFilterRule RPCs.
+func WithPruner(pruner *filter.Pruner, rulesPath string) QueryBackendOption {
+	return func(b *QueryBackend) {
+		b.pruner = pruner
+		b.rulesPath = rulesPath
+	}
+}
 
 // QueryBackend adapts storage.Engine + query.Engine to the IPC Backend interface.
 type QueryBackend struct {
 	store          *storage.Engine
 	engine         *query.Engine
+	frecency       *query.FrecencyStore
+	pruner         *filter.Pruner
+	rulesPath      string
+	l2             AdminL2
+	govMu          sync.Mutex
 	totalColdReads atomic.Int64
 }
 
 // NewQueryBackend creates a production IPC Backend over store and engine.
-func NewQueryBackend(store *storage.Engine, engine *query.Engine) *QueryBackend {
-	return &QueryBackend{
+func NewQueryBackend(store *storage.Engine, engine *query.Engine, opts ...QueryBackendOption) *QueryBackend {
+	b := &QueryBackend{
 		store:  store,
 		engine: engine,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(b)
+		}
+	}
+	return b
+}
+
+// RecordOpen records a file open event in the persistent FrecencyStore.
+func (b *QueryBackend) RecordOpen(_ context.Context, path string) error {
+	if b.frecency == nil {
+		return nil
+	}
+	b.frecency.Record(path)
+	return b.frecency.Save()
+}
+
+// ApplyFilterRule persists a dynamic Fold or HardExclude rule, updates PrunedDirSet,
+// and logically tombstones affected nodes in the index without touching user disk files.
+func (b *QueryBackend) ApplyFilterRule(ctx context.Context, req ApplyFilterRuleReq) (uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if b.store == nil {
+		return 0, &RPCError{Code: ErrInternal, Message: "storage engine unavailable"}
+	}
+
+	targetNorm := normalizeIPCPath(req.TargetPath)
+	if targetNorm == "" {
+		return 0, &RPCError{Code: ErrBadRequest, Message: "empty target path"}
+	}
+
+	var action filter.Action
+	switch req.Action {
+	case FilterActionFold:
+		action = filter.ActionFold
+	case FilterActionHardExclude:
+		action = filter.ActionHardExclude
+	default:
+		return 0, &RPCError{Code: ErrBadRequest, Message: fmt.Sprintf("unsupported filter action %d", req.Action)}
+	}
+
+	b.govMu.Lock()
+	defer b.govMu.Unlock()
+
+	snap := b.store.AcquireSnapshot()
+	var (
+		foundTarget  bool
+		targetNodeID uint32
+		targetNode   storage.HotNode
+		targetName   string
+		children     = make(map[uint32][]uint32)
+	)
+
+	// Fast check by hint NodeID first.
+	if req.NodeID != 0 {
+		if node, name, ok := snap.LookupNode(req.NodeID); ok {
+			if resolved, err := snap.ResolvePathWithSep(req.NodeID, '/'); err == nil && pathsEqualLoose(resolved, targetNorm) {
+				foundTarget = true
+				targetNodeID = req.NodeID
+				targetNode = node
+				targetName = string(name)
+			}
+		}
+	}
+
+	// Build parent->children map and locate targetNodeID if not matched by hint.
+	snap.ForEachLive(func(nodeID uint32, node storage.HotNode, name []byte) bool {
+		if node.ParentIdx != storage.RootParentIdx && node.ParentIdx != storage.OrphanParentIdx {
+			children[node.ParentIdx] = append(children[node.ParentIdx], nodeID)
+		}
+		if !foundTarget {
+			if resolved, err := snap.ResolvePathWithSep(nodeID, '/'); err == nil && pathsEqualLoose(resolved, targetNorm) {
+				foundTarget = true
+				targetNodeID = nodeID
+				targetNode = node
+				targetName = string(name)
+			}
+		}
+		return true
+	})
+
+	// Collect all descendant NodeIDs via BFS.
+	descIDs := make(map[uint32]struct{})
+	if foundTarget && len(children[targetNodeID]) > 0 {
+		visited := map[uint32]struct{}{targetNodeID: {}}
+		queue := append([]uint32(nil), children[targetNodeID]...)
+		for head := 0; head < len(queue); head++ {
+			id := queue[head]
+			if _, seen := visited[id]; seen {
+				continue
+			}
+			visited[id] = struct{}{}
+			descIDs[id] = struct{}{}
+			queue = append(queue, children[id]...)
+		}
+	}
+
+	// Resolve NodeID -> NodeKey for target, target's parent (if Fold), and all descendants.
+	needKeys := make(map[uint32]struct{}, len(descIDs)+2)
+	for id := range descIDs {
+		needKeys[id] = struct{}{}
+	}
+	if foundTarget {
+		needKeys[targetNodeID] = struct{}{}
+		if action == filter.ActionFold && targetNode.ParentIdx != storage.RootParentIdx && targetNode.ParentIdx != storage.OrphanParentIdx {
+			needKeys[targetNode.ParentIdx] = struct{}{}
+		}
+	}
+
+	nodeKeys := make(map[uint32]uint64, len(needKeys))
+	if len(needKeys) > 0 {
+		if mem := snap.MemTable(); mem != nil {
+			mem.ForEachLive(func(nodeID uint32, _ storage.HotNode, _ []byte) bool {
+				if _, ok := needKeys[nodeID]; ok {
+					if slot, okSlot := mem.GetByNodeID(nodeID); okSlot {
+						nodeKeys[nodeID] = mem.KeyAt(slot)
+						delete(needKeys, nodeID)
+					}
+				}
+				return len(needKeys) > 0
+			})
+		}
+		if len(needKeys) > 0 {
+			segs := snap.Segments()
+			for i := len(segs) - 1; i >= 0 && len(needKeys) > 0; i-- {
+				segs[i].ForEachKey(func(_ uint16, nodeKey uint64, nodeID uint32) bool {
+					if _, ok := needKeys[nodeID]; ok {
+						nodeKeys[nodeID] = nodeKey
+						delete(needKeys, nodeID)
+					}
+					return len(needKeys) > 0
+				})
+			}
+		}
+	}
+
+	var targetCold storage.ColdMeta
+	if foundTarget && action == filter.ActionFold {
+		targetCold, _ = snap.ReadColdMeta(targetNodeID)
+	}
+	snap.Release()
+
+	volID := req.VolID
+	var targetKey uint64
+	if foundTarget {
+		volID = targetNode.VolID
+		targetKey = nodeKeys[targetNodeID]
+	}
+
+	if b.pruner != nil {
+		rule := filter.UserRule{
+			Kind:    filter.RuleKindPathPrefix,
+			Pattern: targetNorm,
+			Action:  action,
+			Enabled: true,
+		}
+		if err := b.pruner.ApplyDynamicDirRule(volID, targetKey, rule); err != nil {
+			return 0, &RPCError{Code: ErrBadRequest, Message: err.Error()}
+		}
+		if b.rulesPath != "" {
+			if err := b.pruner.Rules().SaveUserRules(b.rulesPath); err != nil {
+				return 0, &RPCError{Code: ErrInternal, Message: fmt.Sprintf("persist rules: %v", err)}
+			}
+		}
+	}
+
+	if !foundTarget || targetKey == 0 {
+		return 0, nil
+	}
+
+	muts := make([]storage.Mutation, 0, len(descIDs)+1)
+	for id := range descIDs {
+		if k, ok := nodeKeys[id]; ok && k != 0 {
+			muts = append(muts, storage.Mutation{
+				Op:      storage.OpDelete,
+				VolID:   volID,
+				NodeKey: k,
+			})
+		}
+	}
+
+	affected := uint32(len(muts))
+	if action == filter.ActionFold {
+		var parentKey uint64
+		if targetNode.ParentIdx != storage.RootParentIdx && targetNode.ParentIdx != storage.OrphanParentIdx {
+			parentKey = nodeKeys[targetNode.ParentIdx]
+		}
+		muts = append(muts, storage.Mutation{
+			Op:        storage.OpCreate,
+			VolID:     volID,
+			NodeKey:   targetKey,
+			ParentKey: parentKey,
+			Name:      targetName,
+			Flags:     targetNode.Flags | storage.FlagDir | storage.FlagFolded,
+			Size:      targetCold.Size,
+			ModTime:   targetCold.ModTime,
+		})
+	} else {
+		muts = append(muts, storage.Mutation{
+			Op:      storage.OpDelete,
+			VolID:   volID,
+			NodeKey: targetKey,
+		})
+		affected++
+	}
+
+	if len(muts) > 0 {
+		if err := b.store.ApplyBatch(muts); err != nil {
+			return 0, &RPCError{Code: ErrInternal, Message: fmt.Sprintf("apply index rule: %v", err)}
+		}
+	}
+	return affected, nil
+}
+
+func normalizeIPCPath(p string) string {
+	s := strings.TrimSpace(p)
+	if s == "" {
+		return ""
+	}
+	s = strings.ReplaceAll(s, "\\", "/")
+	for len(s) > 1 && strings.HasSuffix(s, "/") {
+		s = strings.TrimSuffix(s, "/")
+	}
+	return s
+}
+
+func pathsEqualLoose(a, b string) bool {
+	na := strings.TrimPrefix(normalizeIPCPath(a), "/")
+	nb := strings.TrimPrefix(normalizeIPCPath(b), "/")
+	return strings.EqualFold(na, nb)
 }
 
 // NewSession returns a per-connection SessionBackend preserving incremental query refinement.

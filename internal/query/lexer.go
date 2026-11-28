@@ -288,8 +288,14 @@ func (p *parser) parseWordToken(tk token) (*Expr, error) {
 					return nil, fmt.Errorf("query: content: requires a search term")
 				}
 				p.q.ContentTerms = append(p.q.ContentTerms, val)
-				p.q.Warnings = append(p.q.Warnings, "content: full-text L2 search is scheduled for Phase 3 (P3-02) and is currently ignored")
-				return nil, nil
+				return &Expr{
+					Kind: ExprAtom,
+					Atom: Atom{
+						Kind:  AtomContent,
+						Value: strings.ToLower(val),
+						Raw:   val,
+					},
+				}, nil
 			}
 		}
 	}

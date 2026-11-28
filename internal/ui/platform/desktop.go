@@ -243,9 +243,10 @@ func (a *Adapter) Close() {
 	}
 }
 
-// ValidateAbsolutePath verifies that p is a non-empty absolute local path with no NUL bytes.
+// ValidateAbsolutePath verifies that p is a non-empty absolute local path with no NUL,
+// quote, or newline characters that could break OS file-manager argument passing.
 func ValidateAbsolutePath(p string) (string, error) {
-	if p == "" || strings.ContainsRune(p, 0) {
+	if p == "" || strings.ContainsAny(p, "\x00\r\n\"") {
 		return "", ErrInvalidPath
 	}
 	if !filepath.IsAbs(p) {

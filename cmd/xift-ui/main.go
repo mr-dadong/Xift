@@ -30,7 +30,7 @@ func main() {
 	flag.Parse()
 
 	if windowWorker {
-		runWindowWorker(endpoint, startMode)
+		runWindowWorker(endpoint)
 		return
 	}
 	runTraySupervisor(endpoint, startMode, idleReclaim)
@@ -106,7 +106,7 @@ func runTraySupervisor(endpoint, startMode string, idleReclaim time.Duration) {
 }
 
 // runWindowWorker runs the on-demand MyGo GPU window subprocess controlled over stdin/stdout.
-func runWindowWorker(endpoint, startMode string) {
+func runWindowWorker(endpoint string) {
 	mygo.App.OnWindowAllClosed(func() {})
 
 	var outMu sync.Mutex
@@ -155,32 +155,43 @@ func runWindowWorker(endpoint, startMode string) {
 				if err := json.Unmarshal(sc.Bytes(), &cmd); err != nil {
 					continue
 				}
-				switch cmd.Cmd {
+				c := cmd
+				switch c.Cmd {
 				case "show":
-					if len(cmd.Warnings) > 0 {
-						app.SetShortcutWarnings(cmd.Warnings)
-					}
-					if cmd.Query != "" {
-						app.SetQueryInput(cmd.Query)
-					}
-					if cmd.Mode == "explorer" {
-						app.ShowExplorer()
-					} else {
-						app.ShowLauncher()
-					}
+					mygo.RunOnMain(func() {
+						if len(c.Warnings) > 0 {
+							app.SetShortcutWarnings(c.Warnings)
+						}
+						if c.Query != "" {
+							app.SetQueryInput(c.Query)
+						}
+						if c.Mode == "explorer" {
+							app.ShowExplorer()
+						} else {
+							app.ShowLauncher()
+						}
+					})
 				case "hide":
-					app.Hide()
+					mygo.RunOnMain(func() {
+						app.Hide()
+					})
 				case "warnings":
-					app.SetShortcutWarnings(cmd.Warnings)
+					mygo.RunOnMain(func() {
+						app.SetShortcutWarnings(c.Warnings)
+					})
 				case "quit":
-					app.Quit()
-					mygo.App.Quit()
+					mygo.RunOnMain(func() {
+						app.Quit()
+						mygo.App.Quit()
+					})
 					return
 				}
 			}
 			// Parent supervisor closed stdin or exited: terminate cleanly to avoid orphan processes.
-			app.Quit()
-			mygo.App.Quit()
+			mygo.RunOnMain(func() {
+				app.Quit()
+				mygo.App.Quit()
+			})
 		}()
 	})
 

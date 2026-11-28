@@ -92,6 +92,16 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 	snap := s.engine.store.AcquireSnapshot()
 	plan := compileQuery(q, s.engine.store.ExtPool())
 
+	empty, contentTrunc, err := s.engine.prepareContent(runCtx, q, plan, opts)
+	if err != nil {
+		snap.Release()
+		return nil, err
+	}
+	if empty {
+		snap.Release()
+		return s.engine.emptyResult(q, plan, opts, start), nil
+	}
+
 	if len(q.InDirs) > 0 {
 		rs, err := s.engine.startFoldedSearch(runCtx, snap, q, plan, opts, start)
 		snap.Release()
@@ -100,25 +110,50 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 
 	var cands []candidate
 	var coldReads int
+	partial := false
+	truncated := contentTrunc
+	verified := 0
 	incremental := false
 
-	if hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q) {
+	// Session incremental narrowing has the highest routing priority, but a
+	// content-only query is seeded from L2 and never narrows a cached L1 set.
+	sessionIncremental := !plan.contentOnly && hasCache && snap.Generation() == cachedGen && isNarrowingQuery(cachedQuery, q)
+	switch {
+	case plan.contentOnly:
+		budget := 0
+		if snap.Tier2Mode() {
+			budget = opts.CandidateBudget
+		}
+		out, scanErr := contentCandidates(runCtx, snap, plan, budget)
+		if scanErr != nil {
+			snap.Release()
+			return nil, scanErr
+		}
+		cands, coldReads, partial = out.cands, out.coldReads, out.partial
+		truncated, verified = truncated || out.truncated, out.verified
+	case routeQuery(plan, storage.SegmentSnapshot{}, sessionIncremental) == routeIncremental:
 		cands, coldReads, err = refineCandidates(runCtx, snap, cachedCands, plan)
 		if err != nil {
 			snap.Release()
 			return nil, err
 		}
+		verified = len(cands)
 		incremental = true
-	} else {
-		cands, coldReads, err = scanSnapshot(runCtx, snap, plan, opts.Workers)
-		if err != nil {
+	default:
+		out, scanErr := scanSnapshot(runCtx, snap, plan, opts.Workers, opts.CandidateBudget)
+		if scanErr != nil {
 			snap.Release()
-			return nil, err
+			return nil, scanErr
 		}
+		cands, coldReads, partial = out.cands, out.coldReads, out.partial
+		truncated, verified = out.truncated || truncated, out.verified
 	}
 
-	// Store compact candidate snapshot for next incremental keystroke if within budget.
-	if len(cands) <= maxCachedSessionCandidates {
+	// Store compact candidate snapshot for next incremental keystroke if within
+	// budget. Truncated results (short-word path or candidate budget) are
+	// incomplete and must not seed the next keystroke, or the 2->3 rune
+	// transition could miss hits.
+	if !plan.contentOnly && len(cands) <= maxCachedSessionCandidates && !partial && !truncated && !containsPartialCandidates(cands) {
 		cacheCopy := make([]candidate, len(cands))
 		copy(cacheCopy, cands)
 		s.mu.Lock()
@@ -138,7 +173,7 @@ func (s *Session) Start(ctx context.Context, rawQuery string, opts SearchOptions
 		s.mu.Unlock()
 	}
 
-	rs, err := s.engine.rankCandidates(runCtx, snap, q, plan, cands, coldReads, incremental, opts, start)
+	rs, err := s.engine.rankCandidates(runCtx, snap, q, plan, cands, coldReads, incremental, opts, start, truncated, verified)
 	if err != nil {
 		snap.Release()
 		return nil, err
@@ -192,6 +227,7 @@ func refineCandidates(
 			node:      node,
 			name:      name,
 			nonASCII:  (node.Flags & storage.FlagNonASCII) != 0,
+			noFuzzy:   c.tier2,
 			coldReady: c.hasCold,
 			coldMeta:  storage.ColdMeta{Size: c.size, ModTime: c.modTime},
 			coldReads: &coldReads,
@@ -204,6 +240,7 @@ func refineCandidates(
 				volID:    node.VolID,
 				nameLen:  node.NameLen,
 				bestTier: tier,
+				tier2:    c.tier2,
 			}
 			if ec.coldReady {
 				next.hasCold = true
@@ -214,6 +251,17 @@ func refineCandidates(
 		}
 	}
 	return out, int(coldReads), nil
+}
+
+// containsPartialCandidates reports whether any candidate came from a
+// truncated (incomplete) scan path.
+func containsPartialCandidates(cands []candidate) bool {
+	for i := range cands {
+		if cands[i].partial {
+			return true
+		}
+	}
+	return false
 }
 
 // isNarrowingQuery conservatively checks whether every node matching next is guaranteed

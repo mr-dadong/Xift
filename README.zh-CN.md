@@ -94,6 +94,34 @@ Windows 用 NTFS MFT + USN Journal，macOS 用 `getattrlistbulk` + FSEvents，Li
 | 交叉编译矩阵（win/linux/darwin × amd64/arm64） | **6 / 6 全绿** | 6 / 6 |
 | `-race` 竞态检测（storage / query / cli） | **0** | 0 |
 
+### 🗄️ Tier 2（磁盘 LSM + Trigram）— `xift-bench` 实测
+
+`CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30`（Windows 11 + NVMe）：
+
+| 指标 | 结果 |
+| :--- | ---: |
+| 构建 110 万节点（Dense Tier 2 段） | **2.92 s** |
+| 索引磁盘占用 | **120.8 MiB** |
+| 冷启动（重新打开） | **1.5 ms** |
+| 选择性查询 p50 / p95 | **< 0.01 ms / 1.5 ms** |
+| 宽匹配合成查询 p50 / p95 | **4.9 / 6.1 ms**（约 10 万命中、有界 Top-K 截断） |
+| 查询态 RSS | **28.9 MiB**（96 MiB 缓存上限） |
+| 构建峰值 RSS | **463 MiB** |
+
+> 宽匹配数字来自刻意构造的对抗性合成语料（10% 名称共享同一词元）；Tier 2 会对宽匹配做有界 Top-K，结果标记 `truncated`。
+
+1 亿节点（`-nodes 100000000 -dirs 10000000`，12 段，零 OOM）：
+
+| 指标 | 结果 |
+| :--- | ---: |
+| 构建 1.1 亿节点（分段 + 外排） | **321 s** |
+| 构建峰值 RSS | **1.67 GiB** |
+| 索引磁盘占用 | **11.8 GiB** |
+| 冷启动（重新打开） | **14.1 ms** |
+| 宽匹配 p50 / p95（约 1000 万命中，截断） | **5.29 / 6.75 ms** |
+| 窄查询 p50 / p95 | **1.54 / 4.61 ms** |
+| 查询态 RSS（新进程） | **57.5 / 63.7 MiB** |
+
 ### 🎯 设计 SLA
 
 | 维度 | Tier 1 · 约 100 万有效文件 | Tier 2 · 1 亿文件 | Everything（参照） |
@@ -154,6 +182,14 @@ type HotNode struct {
 ```
 
 移动一个含 **50 万子文件**的目录，只需改写 **1 个 `uint32`**；在 Tier 2 中删除一个文件，只需翻转 **1 个 bit**。
+
+### 🗄️ Tier 2 存储（≥ 500 万有效节点）
+
+有效节点超过 500 万（或低内存模式）后，新段切换到 Tier 2 布局：trigram/bigram 倒排旁挂文件（拼音首字母单独命名空间）、Front Coding 名称块，且**所有读取只走块缓存**——不再整文件 `mmap`，常驻内存由 96 MiB 分片 LRU 缓存（默认值，可配置）硬性封顶，与索引规模无关。实时变更只写 MemTable 与墓碑位；低优先级后台 worker 负责把 Tier 1 段重建为 Tier 2，并在段数超过 8 时合并最旧段。fuzzy（乱序子序列）仅保留在 Tier 1：trigram posting 无法在不全扫的前提下覆盖它。
+
+构建期内存同样有界：`BuildBudgetBytes`（默认 2 GiB）约束单段构建状态，名字按 fold 排序外排为 run、倒排 posting 超预算时按 gram 外排并在完成阶段归并；单卷节点超过 `DenseSegmentNodes`（默认 1000 万）会自动拆分为多段提交，累计段数超过 32 或总字节超过 4 GiB 才触发分层合并。
+
+Tier 2 交互查询采用**有界 Top-K**：默认最多验证 8192 条命中（`SearchOptions.CandidateBudget`），命中数更多时结果标记 `Truncated`，`Total` 退化为已确认命中的下界；需要精确总数时调用不受预算限制的 `Engine.Count`（可能更慢）。Tier 1 段仍在内存/`mmap` 列上完整扫描，语义不变。
 
 ### 🌪️ 抗风暴事件流水线
 
@@ -244,6 +280,41 @@ xift status
 | `type:file` / `type:dir` | 节点类型 |
 | `in:node_modules lodash` | 按需**深入**被折叠的依赖目录检索，不污染常驻索引 |
 | `all:kernel32` / `sys:` | 解除系统文件降权 |
+| `content:"mutex"` | L2 正文过滤（仅白名单目录），与其余条件 **AND** 求交 |
+
+### 📝 L2 正文检索与离线卷快照
+
+L1 只索引文件名与元数据。可按目录显式加入 L2 白名单，为 UTF-8 文本/代码建立独立的正文索引
+（单文件 ≤ 4 MiB，trigram 倒排 + 精确子串校验）：
+
+```bash
+xift l2 add ~/code          # 加入白名单；daemon 在线时立即扫描并建索引
+xift l2 status --json       # 白名单、已索引数、跳过计数、磁盘占用/上限、暂停标记
+xift l2 remove ~/code
+xift 'content:"mutex" ext:go'   # 正文条件与所有 L1 条件 AND 求交
+```
+
+- `content:` 只返回文件级结果，不含行号、片段或正文高亮。
+- 被折叠/排除的路径（`node_modules`、`.git`、构建产物）与 L1 一样直接跳过。
+- 变更在 60 秒内可见（3 秒防抖）；建索引期间不阻塞任何 L1 查询。
+- 需以 `xift-daemon --l2` 显式启用（默认关闭；未启用时不读取任何白名单目录）。实时事件监听尚未接入，daemon 运行期间的变更需重启或重新 `l2 add` 后可见。
+- 首次索引由 daemon 自身的 L1 扫描完成，不再需要宿主注入路径解析器。
+- 旧版本写下的索引在打开时会改名为 `l2.v1.bak` 并按新格式重建。
+- 未配置白名单或 L2 未启用时，`content:` 查询返回空结果并附带明确 warning，绝不静默忽略条件。
+- 资源上限：L2 独立块缓存 16 MiB（不计入 L1），正文索引磁盘上限 4 GiB（达到后暂停写入），单文件 4 MiB。
+
+卷快照把某个卷的条目物化为可移植的只读副本，拔盘后仍可检索：
+
+```bash
+xift snapshot export --volume 1 --out D:\snap-vol1 --label backups
+xift snapshot import D:\snap-vol1
+xift snapshot list --json
+xift snapshot remove 1
+```
+
+包内 `snapshot.json` 记录卷标识/卷标/根路径/导出时间/节点数与每个文件的 crc32c；
+损坏或不完整的包在挂载前即被拒绝。挂载后的条目参与普通查询，结果行标注
+`snapshot_vol` 与 `offline: true`，且永不参与压缩、墓碑清理或写入。
 
 ### 🖥️ 桌面 UI（`xift-ui`）
 
@@ -264,8 +335,11 @@ xift-ui -mode tray      # 仅驻留系统托盘，按需唤起
 | `Alt+Space` | 全局唤起 / 聚焦 **Launcher** 悬浮快搜窗 |
 | `Ctrl+Alt+Space` | 全局唤起 / 聚焦 **Explorer** 四列主窗 |
 | `↑` / `↓` | 在可浏览结果范围内上下选择 |
-| `Enter` | 使用系统默认应用打开所选文件 |
-| `Ctrl+Enter` | 在系统文件管理器中定位所选文件目录 |
+| `Enter` | 使用系统默认应用打开所选文件（同步更新 Frecency 排序权重） |
+| `Ctrl+Enter` | 在系统文件管理器中定位所选文件目录（同步更新 Frecency 排序权重） |
+| `Tab` | 开关右侧非阻塞内置预览（文本/代码/Markdown、图片缩略图、`.zip`/`.tar.gz` 目录头、PDF 元信息） |
+| `右键` | 弹出原生右键菜单（打开、定位目录、复制路径/文件名、开关预览、折叠所属目录、永久排除此路径） |
+| `拖拽` | 将结果行直接拖出到外部编辑器、聊天软件或文件管理器 |
 | `Esc` | 隐藏窗口到托盘（连续全隐藏满 30 秒后窗口渲染子进程自动退出，彻底归还 GPU 与显卡驱动内存，零 GPU 托盘宿主保持常驻） |
 
 **平台要求与说明：**
@@ -311,7 +385,7 @@ xift --daemon ext:go --limit 50                      # 通过 IPC 查询运行�
 | :--- | :--- | :-: |
 | **0 · 技术 Spike** | MyGo `ui.List` 300 万行压测 · Pure Go MFT 扫描与两阶段剪枝 | ✅ |
 | **1 · Tier 1 引擎** | 列式存储 + `mmap` + MemTable + WAL · 三级剪枝 · 三端采集器 · 150 ms 批处理 · 查询 DSL · CLI | ✅ |
-| **2 · 原生 UI** | 安全 IPC 与视口分页 RPC · Launcher 浮窗 + Explorer 主窗 · 模糊 / 拼音 / Frecency · 图标图集 · 原生右键与拖拽 · 内置预览 | 🚧 |
+| **2 · 原生 UI** | 安全 IPC 与视口分页 RPC · Launcher 浮窗 + Explorer 主窗 · 模糊 / 拼音 / Frecency · 图标图集 · 原生右键与拖拽 · 内置预览 | ✅ |
 | **3 · 亿级与生态** | Tier 2 LSM + Trigram + 固定预算 LRU · 白名单目录全文 · 离线卷快照 · MCP Server | 🔭 |
 
 ---
@@ -329,6 +403,11 @@ CGO_ENABLED=1 go test -race -count=1 ./internal/...
 
 # 基准测试
 CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
+
+# Tier 2 端到端合成压测（构建 / 磁盘 / 冷启动 / 延迟 / RSS）
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 100000000 -dirs 10000000 -queries 50
+#   其他参数：-data-dir <dir> -keep -tier2=false -cache-bytes <n> -terms 'a|b' -json
 ```
 
 <details>
@@ -338,6 +417,7 @@ CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
 Xift/
 ├── cmd/
 │   ├── xift/              # 命令行
+│   ├── xift-bench/        # Tier 2 合成压测（构建/磁盘/延迟/RSS）
 │   ├── xift-daemon/       # 后台索引守护进程
 │   └── xift-ui/           # MyGo 原生桌面 UI（Launcher + Explorer）
 ├── internal/

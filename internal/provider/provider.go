@@ -147,4 +147,9 @@ type FSProvider interface {
 
 	// ScanSubtree performs a bounded read-only subtree scan rooted at dirPath for EventRescanDir recovery.
 	ScanSubtree(ctx context.Context, vol VolumeInfo, dirPath string, dirKey uint64, writer SegmentWriter) error
+
+	// ScanSubtreeWithRoot scans dirPath like ScanSubtree but resolves the root's
+	// key itself and emits the root directory as the first record
+	// (ParentKey == NodeKey), letting callers compose paths from parent keys.
+	ScanSubtreeWithRoot(ctx context.Context, vol VolumeInfo, dirPath string, writer SegmentWriter) error
 }

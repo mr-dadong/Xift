@@ -224,3 +224,38 @@ func TestDaemonCrossProcessQueryAndStatus(t *testing.T) {
 		t.Fatalf("unexpected cross-process rows: %+v", vp.Rows)
 	}
 }
+
+func TestDaemonHonorsBlockCacheConfig(t *testing.T) {
+	dataDir := t.TempDir()
+	seedDaemonTestIndex(t, dataDir, 10)
+	ep := uniqueDaemonEndpoint(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Config{
+			DataDir:         dataDir,
+			Endpoint:        ep,
+			BlockCacheBytes: 1 << 20,
+			OnReady:         func(addr string) { ready <- addr },
+		})
+	}()
+
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("daemon exited early: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not become ready in time")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("daemon shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not shut down")
+	}
+}

@@ -242,6 +242,49 @@ func (c *Client) Status(ctx context.Context) (*StatusReply, error) {
 	return st, nil
 }
 
+// RecordOpen notifies the Daemon that the user opened or revealed path to boost Frecency ranking.
+func (c *Client) RecordOpen(ctx context.Context, path string) error {
+	msg, err := c.call(ctx, &RecordOpenReq{Path: path})
+	if err != nil {
+		return err
+	}
+	if _, ok := msg.(*RecordOpenAck); !ok {
+		return fmt.Errorf("ipc: unexpected RecordOpen response %T", msg)
+	}
+	return nil
+}
+
+// ApplyFilterRule asks the Daemon to fold or hard-exclude targetPath and prune affected index nodes.
+func (c *Client) ApplyFilterRule(ctx context.Context, action uint8, targetPath string, nodeID uint32, volID uint16) (uint32, error) {
+	msg, err := c.call(ctx, &ApplyFilterRuleReq{
+		Action:     action,
+		TargetPath: targetPath,
+		NodeID:     nodeID,
+		VolID:      volID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	ack, ok := msg.(*ApplyFilterRuleAck)
+	if !ok {
+		return 0, fmt.Errorf("ipc: unexpected ApplyFilterRule response %T", msg)
+	}
+	return ack.AffectedCount, nil
+}
+
+// Admin calls one administrative operation and returns its JSON result.
+func (c *Client) Admin(ctx context.Context, op string, payload []byte) ([]byte, error) {
+	msg, err := c.call(ctx, &AdminReq{Op: op, Payload: string(payload)})
+	if err != nil {
+		return nil, err
+	}
+	ack, ok := msg.(*AdminAck)
+	if !ok {
+		return nil, fmt.Errorf("ipc: unexpected Admin response %T", msg)
+	}
+	return []byte(ack.Payload), nil
+}
+
 // IsRPCError reports whether err is an *RPCError with the given code.
 func IsRPCError(err error, code ErrCode) bool {
 	var rpcErr *RPCError

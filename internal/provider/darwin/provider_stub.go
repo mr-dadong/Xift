@@ -32,3 +32,7 @@ func (p *Provider) Watch(context.Context, provider.VolumeInfo, uint64, chan<- pr
 func (p *Provider) ScanSubtree(context.Context, provider.VolumeInfo, string, uint64, provider.SegmentWriter) error {
 	return provider.ErrUnsupportedOS
 }
+
+func (p *Provider) ScanSubtreeWithRoot(context.Context, provider.VolumeInfo, string, provider.SegmentWriter) error {
+	return provider.ErrUnsupportedOS
+}

@@ -2,6 +2,20 @@ package storage
 
 import "math"
 
+// EnableInverted turns on the bounded in-memory gram index used by the Tier 2
+// query path. It is a no-op if already enabled and rebuilds from current live
+// entries so it can be switched on after the table has been populated.
+func (m *MemTable) EnableInverted() {
+	if m.inv != nil {
+		return
+	}
+	m.inv = newMemInverted()
+	m.inv.rebuild(m)
+}
+
+// InvertedEnabled reports whether the in-memory gram index is active.
+func (m *MemTable) InvertedEnabled() bool { return m.inv != nil }
+
 // MemTable is a zero-GC (noscan) incremental L0 layer holding recent real-time mutations.
 // All backing slices contain pointer-free scalar/struct types only.
 type MemTable struct {
@@ -15,6 +29,8 @@ type MemTable struct {
 	byNodeID      *u32Map
 	coldOverrides *coldOverrideMap
 	liveCount     int
+	inv           *memInverted
+	gramBuf       []uint64
 }
 
 // NewMemTable creates a zero-GC MemTable pre-sized for initialCap entries.
@@ -99,6 +115,12 @@ func (m *MemTable) Upsert(
 		if wasDeleted {
 			m.liveCount++
 		}
+		// Superset semantics: old-name grams stay behind (verification filters
+		// them); the new name's grams must be immediately visible.
+		if m.inv != nil {
+			m.gramBuf = m.inv.addName(m.nameArena[nameOff:nameOff+uint32(nameLen)], nodeID, m.gramBuf)
+			m.inv.maybeRebuild(m)
+		}
 		return slotIdx, true
 	}
 
@@ -122,6 +144,10 @@ func (m *MemTable) Upsert(
 	m.byKey.Put(volID, nodeKey, slotIdx)
 	m.byNodeID.Put(nodeID, slotIdx)
 	m.liveCount++
+	if m.inv != nil {
+		m.gramBuf = m.inv.addName(m.nameArena[nameOff:nameOff+uint32(nameLen)], nodeID, m.gramBuf)
+		m.inv.maybeRebuild(m)
+	}
 	return slotIdx, false
 }
 
@@ -244,8 +270,15 @@ func (m *MemTable) ForEachColdOverride(fn func(nodeID uint32, nodeKey uint64, me
 
 // CloneSnapshot produces an immutable pointer-free copy of the MemTable for lock-free concurrent reads.
 func (m *MemTable) CloneSnapshot() *MemTable {
-	if m == nil || (m.liveCount == 0 && m.coldOverrides.Len() == 0) {
+	if m == nil {
 		return NewMemTable(16)
+	}
+	if m.liveCount == 0 && m.coldOverrides.Len() == 0 {
+		cp := NewMemTable(16)
+		if m.inv != nil {
+			cp.EnableInverted()
+		}
+		return cp
 	}
 	cp := &MemTable{
 		nodes:         append([]HotNode(nil), m.nodes...),
@@ -258,6 +291,9 @@ func (m *MemTable) CloneSnapshot() *MemTable {
 		byNodeID:      &u32Map{slots: append([]u32Slot(nil), m.byNodeID.slots...), mask: m.byNodeID.mask, count: m.byNodeID.count},
 		coldOverrides: &coldOverrideMap{slots: append([]coldOverrideSlot(nil), m.coldOverrides.slots...), mask: m.coldOverrides.mask, count: m.coldOverrides.count},
 		liveCount:     m.liveCount,
+	}
+	if m.inv != nil {
+		cp.inv = m.inv.clone()
 	}
 	return cp
 }
@@ -274,4 +310,7 @@ func (m *MemTable) Reset() {
 	m.byNodeID.Clear()
 	m.coldOverrides.Clear()
 	m.liveCount = 0
+	if m.inv != nil {
+		m.inv.clear()
+	}
 }

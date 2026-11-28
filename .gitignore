@@ -1,0 +1,12 @@
+# Binaries produced by `go build ./cmd/...` at the repository root.
+/xift
+/xift.exe
+/xift-daemon
+/xift-daemon.exe
+/xift-ui
+/xift-ui.exe
+/xift-bench
+/xift-bench.exe
+
+# Local benchmark / index scratch output.
+/xift-bench-data/

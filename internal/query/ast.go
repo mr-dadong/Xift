@@ -21,6 +21,9 @@ const (
 	AtomModTime
 	AtomPath
 	AtomType
+	// AtomContent matches a file whose indexed body contains Value (case-folded
+	// ASCII substring). It is resolved through the optional L2 ContentSearcher.
+	AtomContent
 )
 
 // SizeRange represents an inclusive byte size range [Min, Max].
@@ -88,7 +91,7 @@ type Query struct {
 	Root          *Expr    // Nil means match all live nodes (empty filter)
 	IncludeSystem bool     // Set by all: or sys:
 	InDirs        []string // Folded/named directories requested by in:<dir>
-	ContentTerms  []string // Reserved for Phase 3 P3-02 L2 full-text search
+	ContentTerms  []string // Raw content: terms in source order
 	Warnings      []string // Non-fatal diagnostics (e.g. L2 content: not yet enabled)
 }
 

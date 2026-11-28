@@ -52,6 +52,9 @@ type SearchOptions struct {
 	FoldedMaxEntries int
 	FoldedMaxDepth   int
 	MaxRetained      int
+	// CandidateBudget bounds how many matches one interactive query may verify
+	// before reporting a truncated result (0 = DefaultCandidateBudget).
+	CandidateBudget int
 }
 
 func (o *SearchOptions) normalize() {
@@ -86,6 +89,9 @@ func (o *SearchOptions) normalize() {
 	if o.MaxRetained <= 0 {
 		o.MaxRetained = DefaultMaxRetained
 	}
+	if o.CandidateBudget <= 0 {
+		o.CandidateBudget = DefaultCandidateBudget
+	}
 }
 
 // ResultItem is a fully materialized viewport row returned to CLI, IPC, or UI callers.
@@ -104,6 +110,10 @@ type ResultItem struct {
 	ModTime        int64            `json:"mtime"`
 	Score          float64          `json:"score"`
 	Highlights     []HighlightRange `json:"highlights,omitempty"`
+	// SnapshotVol labels rows served from a mounted read-only volume snapshot;
+	// Offline marks that such rows outlived their source volume.
+	SnapshotVol string `json:"snapshot_vol,omitempty"`
+	Offline     bool   `json:"offline,omitempty"`
 }
 
 // SearchResult holds query execution metadata and the materialized viewport slice.
@@ -119,6 +129,12 @@ type SearchResult struct {
 	ColdReads   int           `json:"-"`
 	Warnings    []string      `json:"warnings,omitempty"`
 	Items       []ResultItem  `json:"results"`
+	// Truncated reports that the candidate budget was exhausted, so more matches
+	// may exist than were counted.
+	Truncated bool `json:"truncated,omitempty"`
+	// TotalLowerBound is the verified match count when Truncated is true, and 0
+	// when Total is exact.
+	TotalLowerBound int `json:"total_lower_bound,omitempty"`
 }
 
 // EngineOption customizes query.Engine construction.
@@ -136,6 +152,7 @@ func WithFrecency(fp FrecencyProvider) EngineOption {
 type Engine struct {
 	store    *storage.Engine
 	frecency FrecencyProvider
+	content  ContentSearcher
 }
 
 // NewEngine creates a query Engine backed by store.
@@ -172,18 +189,37 @@ func (e *Engine) Start(ctx context.Context, rawQuery string, opts SearchOptions)
 	snap := e.store.AcquireSnapshot()
 	plan := compileQuery(q, e.store.ExtPool())
 
+	empty, contentTrunc, err := e.prepareContent(ctx, q, plan, opts)
+	if err != nil {
+		snap.Release()
+		return nil, err
+	}
+	if empty {
+		snap.Release()
+		return e.emptyResult(q, plan, opts, start), nil
+	}
+
 	if len(q.InDirs) > 0 {
 		rs, err := e.startFoldedSearch(ctx, snap, q, plan, opts, start)
 		snap.Release()
 		return rs, err
 	}
 
-	cands, coldReads, err := scanSnapshot(ctx, snap, plan, opts.Workers)
+	var out scanOutcome
+	if plan.contentOnly {
+		budget := 0
+		if snap.Tier2Mode() {
+			budget = opts.CandidateBudget
+		}
+		out, err = contentCandidates(ctx, snap, plan, budget)
+	} else {
+		out, err = scanSnapshot(ctx, snap, plan, opts.Workers, opts.CandidateBudget)
+	}
 	if err != nil {
 		snap.Release()
 		return nil, err
 	}
-	rs, err := e.rankCandidates(ctx, snap, q, plan, cands, coldReads, false, opts, start)
+	rs, err := e.rankCandidates(ctx, snap, q, plan, out.cands, out.coldReads, false, opts, start, out.truncated || contentTrunc, out.verified)
 	if err != nil {
 		snap.Release()
 		return nil, err
@@ -207,4 +243,45 @@ func (e *Engine) Search(ctx context.Context, rawQuery string, opts SearchOptions
 		return nil, err
 	}
 	return rs.toSearchResult(items, opts.Offset, opts.Limit, start), nil
+}
+
+// Count returns the exact number of nodes matching rawQuery. It deliberately
+// ignores the interactive candidate budget, so it may take much longer than
+// Search at large scale; it never retains candidates or affects later queries.
+func (e *Engine) Count(ctx context.Context, rawQuery string, opts SearchOptions) (int, error) {
+	if e == nil || e.store == nil {
+		return 0, fmt.Errorf("query: nil storage engine")
+	}
+	opts.normalize()
+
+	q, err := ParseAt(rawQuery, opts.Now)
+	if err != nil {
+		return 0, err
+	}
+	if len(q.InDirs) > 0 {
+		return 0, fmt.Errorf("query: exact count is not supported for in: scoped queries")
+	}
+
+	snap := e.store.AcquireSnapshot()
+	defer snap.Release()
+	plan := compileQuery(q, e.store.ExtPool())
+	empty, _, err := e.prepareContent(ctx, q, plan, opts)
+	if err != nil {
+		return 0, err
+	}
+	if empty {
+		return 0, nil
+	}
+	if plan.contentOnly {
+		out, err := contentCandidates(ctx, snap, plan, 0)
+		if err != nil {
+			return 0, err
+		}
+		return out.verified, nil
+	}
+	out, err := scanSnapshot(ctx, snap, plan, opts.Workers, 0)
+	if err != nil {
+		return 0, err
+	}
+	return out.verified, nil
 }

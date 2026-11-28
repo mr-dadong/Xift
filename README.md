@@ -94,6 +94,22 @@ Below 5M files: `mmap` columns. Above that: an LSM + Trigram engine behind a **f
 | Cross-compile matrix (win/linux/darwin × amd64/arm64) | **6 / 6 green** | 6 / 6 |
 | Data races under `-race` (storage / query / cli) | **0** | 0 |
 
+### 🗄️ Tier 2 (disk LSM + trigram) — measured with `xift-bench`
+
+`CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30` on Windows 11 + NVMe:
+
+| Metric | Result |
+| :--- | ---: |
+| Build 1.1M nodes (Dense Tier 2 segment) | **2.92 s** |
+| Index size on disk | **120.8 MiB** |
+| Cold start (reopen) | **1.5 ms** |
+| Selective query p50 / p95 | **< 0.01 ms / 1.5 ms** |
+| Wide-match synthetic query p50 / p95 | **4.9 / 6.1 ms** (≈100k hits, bounded Top-K) |
+| Query-time RSS (96 MiB cache cap) | **28.9 MiB** |
+| Build peak RSS | **463 MiB** |
+
+> The wide-match number is a deliberately adversarial synthetic corpus where 10% of all names share one token; Tier 2 bounds wide matches with Top-K and flags them `truncated`.
+
 ### 🎯 Design SLAs
 
 | Dimension | Tier 1 · ~1M effective files | Tier 2 · 100M files | Everything (reference) |
@@ -154,6 +170,14 @@ type HotNode struct {
 ```
 
 Moving a directory with **500,000 children** means rewriting **one `uint32`**. Deleting a file in Tier 2 means flipping **one bit**.
+
+### 🗄️ Tier 2 storage (≥ 5M live nodes)
+
+Above 5M live nodes (or in low-memory mode) new segments switch to the Tier 2 layout: trigram/bigram inverted sidecars (pinyin-initials indexed in a separate namespace), front-coded name blocks, and **block-cache-only reads** — no whole-file `mmap`, so resident memory is bounded by the 96 MiB sharded LRU cache (default, configurable) regardless of index size. Live changes only touch the MemTable and tombstone bits; a low-priority background worker rebuilds Tier 1 segments into Tier 2 and merges the oldest segments once there are more than eight. Fuzzy (discrete-subsequence) matching is intentionally Tier 1 only: trigram postings cannot bound it without a scan.
+
+Build memory is bounded too: `BuildBudgetBytes` (2 GiB by default) caps one segment's build state — names spill to fold-sorted runs and inverted postings spill per gram, both merged at finish. Volumes above `DenseSegmentNodes` (10M by default) are committed as multiple segments, and tiered compaction only kicks in past 32 segments or 4 GiB of committed segments.
+
+Tier 2 interactive queries use **bounded Top-K**: at most 8192 matches are verified by default (`SearchOptions.CandidateBudget`). Beyond that the result is flagged `Truncated` and `Total` degrades to a confirmed-hit lower bound; call `Engine.Count` when an exact total is required (it ignores the budget and may be slower). Tier 1 scans in-memory/`mmap` columns in full, so its semantics are unchanged.
 
 ### 🌪️ Storm-proof event pipeline
 
@@ -244,6 +268,44 @@ xift status
 | `type:file` / `type:dir` | node type |
 | `in:node_modules lodash` | peek **inside** a folded dependency dir, on demand, no index pollution |
 | `all:kernel32` / `sys:` | lift the system-file demotion |
+| `content:"mutex"` | L2 body filter (whitelisted dirs only), **ANDed** with every other condition |
+
+### 📝 L2 content search & offline volume snapshots
+
+L1 indexes names and metadata only. Opt in per directory to a separate L2
+full-text index of UTF-8 text/code (≤ 4 MiB per file, trigram postings plus exact
+substring verification):
+
+```bash
+xift l2 add ~/code          # whitelist a directory; a running daemon scans and indexes it right away
+xift l2 status --json       # roots, indexed docs, skip counters, disk usage/cap, paused
+xift l2 remove ~/code
+xift 'content:"mutex" ext:go'   # body filter ANDed with all L1 conditions
+```
+
+- `content:` returns file-level rows only — no line numbers, snippets or body highlights.
+- Folded/excluded paths (`node_modules`, `.git`, build output) are skipped exactly as in L1.
+- Changes become visible within 60 s (3 s debounce); indexing never blocks L1 queries.
+- The daemon builds the first index from its own L1 scan; no host-side path resolver is needed.
+- An index written by an older version is renamed to `l2.v1.bak` on open and rebuilt from scratch.
+- Without a whitelist or with L2 disabled, a `content:` query returns an empty result **plus a warning** instead of silently ignoring the filter.
+- Budgets: 16 MiB L2 block cache (independent of L1), 4 GiB content-index disk cap (ingestion pauses at the cap), 4 MiB per file.
+- Enable it on the daemon with `xift-daemon --l2` (off by default; without the flag no whitelisted directory is read). Live watching is not wired yet, so changes made while the daemon runs become visible after a restart or re-adding the directory.
+
+A volume snapshot is a portable, read-only materialization of one volume's rows
+that keeps working after the drive is unplugged:
+
+```bash
+xift snapshot export --volume 1 --out D:\snap-vol1 --label backups
+xift snapshot import D:\snap-vol1
+xift snapshot list --json
+xift snapshot remove 1
+```
+
+Packages carry a `snapshot.json` manifest with per-file crc32c checksums; a
+corrupt or incomplete package is rejected before mounting. Mounted rows appear
+in normal queries labelled `snapshot_vol` / `offline: true`, and are never
+compacted, tombstoned or written by the daemon.
 
 ### 🖥️ Desktop UI (`xift-ui`)
 
@@ -264,8 +326,11 @@ xift-ui -mode tray      # starts resident in the system tray
 | `Alt+Space` | Global shortcut to focus/open **Launcher** quick-search panel |
 | `Ctrl+Alt+Space` | Global shortcut to focus/open **Explorer** multi-column window |
 | `↑` / `↓` | Move selection within retained search results |
-| `Enter` | Open selected file with default OS application |
-| `Ctrl+Enter` | Reveal selected file in OS file manager |
+| `Enter` | Open selected file with default OS application (also records Frecency) |
+| `Ctrl+Enter` | Reveal selected file in OS file manager (also records Frecency) |
+| `Tab` | Toggle non-blocking split preview pane (code/text, Markdown, images, `.zip`/`.tar.gz`, PDF metadata) |
+| `Right-Click` | Open native context menu (Open, Reveal, Copy Path/Name, Preview, Fold Parent Dir, Exclude Path) |
+| `Drag` | Drag a result row directly into external desktop apps |
 | `Esc` | Hide window to tray (after 30 s hidden, the window worker exits to release GPU/driver memory while the tray host stays resident) |
 
 **Platform notes:**
@@ -311,7 +376,7 @@ xift --daemon ext:go --limit 50                      # query the running daemon 
 | :--- | :--- | :-: |
 | **0 · Spike** | MyGo `ui.List` 3M-row stress demo · Pure Go MFT scan + two-pass pruning | ✅ |
 | **1 · Tier 1 engine** | Columnar storage + `mmap` + MemTable + WAL · 3-level pruner · 3 OS providers · 150 ms batcher · query DSL · CLI | ✅ |
-| **2 · Native UI** | Secure IPC & viewport RPC · Launcher + Explorer windows · Fuzzy / Pinyin / Frecency · icon atlas · native context menu & drag-out · previews | 🚧 |
+| **2 · Native UI** | Secure IPC & viewport RPC · Launcher + Explorer windows · Fuzzy / Pinyin / Frecency · icon atlas · native context menu & drag-out · previews | ✅ |
 | **3 · 100M+ & ecosystem** | Tier 2 LSM + Trigram + fixed-budget LRU · full-text for whitelisted dirs · offline volume snapshots · MCP server | 🔭 |
 
 ---
@@ -329,6 +394,11 @@ CGO_ENABLED=1 go test -race -count=1 ./internal/...
 
 # Benchmarks
 CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
+
+# Tier 2 end-to-end synthetic benchmark (build / disk / cold start / latency / RSS)
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 1000000 -dirs 100000 -queries 30
+CGO_ENABLED=0 go run ./cmd/xift-bench -nodes 100000000 -dirs 10000000 -queries 50
+#   extra flags: -data-dir <dir> -keep -tier2=false -cache-bytes <n> -terms 'a|b' -json
 ```
 
 <details>
@@ -338,6 +408,7 @@ CGO_ENABLED=0 go test -run '^$' -bench . -benchmem ./internal/query/...
 Xift/
 ├── cmd/
 │   ├── xift/              # CLI
+│   ├── xift-bench/        # synthetic Tier 2 benchmark (build/disk/latency/RSS)
 │   ├── xift-daemon/       # background indexing daemon
 │   └── xift-ui/           # MyGo native desktop UI (Launcher + Explorer)
 ├── internal/

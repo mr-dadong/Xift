@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/mr-dadong/Xift/internal/storage/lsm"
 )
 
 // Options configures the Tier 1 columnar storage engine.
@@ -20,11 +23,27 @@ type Options struct {
 	Tier2Threshold uint64
 	// LowMemoryMode forces RecommendedTier to return Tier2LSM regardless of live node count.
 	LowMemoryMode bool
+	// BuildBudgetBytes bounds one dense segment's build-time resident state;
+	// names and inverted postings spill to sorted runs beyond it.
+	// Defaults to DefaultBuildBudgetBytes.
+	BuildBudgetBytes int64
+	// DenseSegmentNodes bounds how many nodes one dense segment holds.
+	// Defaults to DefaultDenseSegmentNodes.
+	DenseSegmentNodes int
 	// MemTableFlushThreshold is the MemTable entry count at which AutoFlush triggers.
 	// Defaults to DefaultMemTableFlushThreshold (65,536).
 	MemTableFlushThreshold int
 	// AutoFlush automatically flushes MemTable to a delta segment when MemTableFlushThreshold is reached.
 	AutoFlush bool
+	// BlockCacheBytes is the hard byte budget of the Tier 2 shared block
+	// cache. Zero selects lsm.DefaultBlockCacheBytes (96 MiB).
+	BlockCacheBytes int64
+	// DisableBackgroundMaintenance suppresses automatic background maintenance:
+	// the Tier 2 rebuild that merges Tier 1 segments after a tier switch and
+	// the tiered compaction that merges the oldest segments once their count
+	// exceeds tier2CompactionSegmentThreshold. Operators can then run Compact
+	// or CompactOldest at a time of their choosing.
+	DisableBackgroundMaintenance bool
 }
 
 // OpenStats reports diagnostic metrics collected during Engine cold start.
@@ -50,11 +69,150 @@ type Engine struct {
 	extPool          *ExtPool
 	wal              *WAL
 	segments         []*Segment // ordered oldest (base) -> newest (deltas)
-	mem              *MemTable
-	memShared        atomic.Bool // true when at least one Snapshot shares e.mem (CoW on next write)
-	writeGen         uint64      // monotonically incremented under e.mu.Lock on any mutation/segment change
-	dirByKey         *KeyMap
-	openStats        OpenStats
+	// snapshots holds mounted read-only snapshot packages. They participate in
+	// queries through AcquireSnapshot but are never compacted or tombstoned.
+	snapshots  []*snapshotMount
+	mem        *MemTable
+	memShared  atomic.Bool // true when at least one Snapshot shares e.mem (CoW on next write)
+	writeGen   uint64      // monotonically incremented under e.mu.Lock on any mutation/segment change
+	openStats  OpenStats
+	blockCache *lsm.BlockCache
+	// tier2Sticky latches once the engine crosses into Tier 2; every segment
+	// built afterwards carries inverted sidecars so the scan tail cannot grow
+	// back after the live count dips below the threshold.
+	tier2Sticky       bool
+	maintenanceActive atomic.Bool
+	backgroundWork    sync.WaitGroup
+	closeDone         chan struct{}
+}
+
+// Tier 2 background maintenance policy.
+const (
+	// tier2CompactionSegmentThreshold is the segment count above which the
+	// oldest segments are merged in the background.
+	tier2CompactionSegmentThreshold = 32
+	// tier2CompactionBytesThreshold triggers the same merge when the committed
+	// segments exceed this total size, even below the segment-count threshold.
+	tier2CompactionBytesThreshold int64 = 4 << 30
+	// tier2CompactionBatch is how many of the oldest segments one run merges.
+	tier2CompactionBatch = 8
+)
+
+// maybeScheduleMaintenanceLocked schedules at most one background maintenance
+// worker: first a full Tier 2 rebuild when Tier 1 segments remain, otherwise a
+// tiered merge of the oldest segments once their count crosses the threshold.
+// The worker runs at the lowest OS thread priority. Tiered merges build outside
+// the engine lock; the one-shot full rebuild still holds it while it rewrites
+// every segment (the Tier 1 -> Tier 2 transition window). Callers hold e.mu.
+func (e *Engine) maybeScheduleMaintenanceLocked() {
+	if e.closed || e.opts.DisableBackgroundMaintenance || !e.tier2Sticky || e.denseBuildActive {
+		return
+	}
+	hybrid := false
+	for _, s := range e.segments {
+		if !s.IsTier2() {
+			hybrid = true
+			break
+		}
+	}
+	if !hybrid && !e.needsTieredCompactionLocked() {
+		return
+	}
+	if !e.maintenanceActive.CompareAndSwap(false, true) {
+		return
+	}
+	n := tier2CompactionBatch
+	if hybrid {
+		n = 0 // full rebuild via Compact
+	}
+	e.backgroundWork.Add(1)
+	go func() {
+		defer e.backgroundWork.Done()
+		defer e.maintenanceActive.Store(false)
+		restore := lockOSThreadLowPriority()
+		defer restore()
+		if n == 0 {
+			_ = e.compactIfIdle()
+			return
+		}
+		_ = e.CompactOldest(n)
+	}()
+}
+
+// needsTieredCompactionLocked reports whether the committed segments exceed the
+// segment-count or total-size threshold. Callers hold e.mu.
+func (e *Engine) needsTieredCompactionLocked() bool {
+	if len(e.segments) > tier2CompactionSegmentThreshold {
+		return true
+	}
+	var total int64
+	for _, s := range e.segments {
+		total += s.SizeBytes()
+	}
+	return total > tier2CompactionBytesThreshold
+}
+
+// manifestBackupSuffix names the one-generation MANIFEST snapshot kept from
+// before the index was upgraded to Tier 2, so operators can roll back to a
+// pre-upgrade binary.
+const manifestBackupSuffix = ".bak"
+
+// backupManifestBeforeTier2Upgrade preserves the committed MANIFEST bytes the
+// first time a Tier 2 segment is about to be recorded. Older generations are
+// never overwritten so the rollback target stays the pre-upgrade state.
+// Callers hold e.mu.
+func (e *Engine) backupManifestBeforeTier2Upgrade(next *Manifest) error {
+	if !next.HasTier2() || e.manifest.HasTier2() {
+		return nil
+	}
+	path := filepath.Join(e.indexDir, "MANIFEST")
+	backup := path + manifestBackupSuffix
+	if _, err := os.Stat(backup); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // fresh index: nothing to preserve
+		}
+		return err
+	}
+	return atomicWriteFile(backup, raw)
+}
+
+// liveCountLocked mirrors LiveCount without taking e.mu (callers hold it).
+func (e *Engine) liveCountLocked() uint64 {
+	var total uint64
+	for _, s := range e.segments {
+		total += uint64(s.LiveCount())
+	}
+	total += uint64(e.mem.LiveCount())
+	return total
+}
+
+// tier2EnabledLocked reports whether new segments must be built as Tier 2 and
+// latches the decision for the lifetime of the engine.
+func (e *Engine) tier2EnabledLocked() bool {
+	if e.tier2Sticky {
+		e.enableMemInvertedLocked()
+		return true
+	}
+	if e.opts.LowMemoryMode || e.liveCountLocked() >= e.opts.Tier2Threshold {
+		e.tier2Sticky = true
+		e.enableMemInvertedLocked()
+		return true
+	}
+	return false
+}
+
+// enableMemInvertedLocked turns on the MemTable gram index, first detaching it
+// from any shared snapshot so the snapshot cannot observe a concurrent map
+// write. Callers hold e.mu.
+func (e *Engine) enableMemInvertedLocked() {
+	e.ensureMemWritableLocked()
+	e.mem.EnableInverted()
 }
 
 // Open mounts an existing index under <dataDir>/index/ or initializes a new one.
@@ -65,6 +223,12 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 	}
 	if opts.MemTableFlushThreshold <= 0 {
 		opts.MemTableFlushThreshold = DefaultMemTableFlushThreshold
+	}
+	if opts.BuildBudgetBytes <= 0 {
+		opts.BuildBudgetBytes = DefaultBuildBudgetBytes
+	}
+	if opts.DenseSegmentNodes <= 0 {
+		opts.DenseSegmentNodes = DefaultDenseSegmentNodes
 	}
 
 	indexDir := filepath.Join(dataDir, "index")
@@ -86,6 +250,9 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 
+	// Shared Tier 2 block cache: all segments route cached reads through it.
+	blockCache := lsm.NewBlockCache(opts.BlockCacheBytes)
+
 	// Open active segments referenced by MANIFEST with their committed tombstone generation.
 	activeNames := make(map[string]struct{}, len(manifest.Segments))
 	segments := make([]*Segment, 0, len(manifest.Segments))
@@ -93,11 +260,12 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 		for _, s := range segments {
 			s.Release()
 		}
+		blockCache.Close()
 	}
 	for _, sm := range manifest.Segments {
 		name := SegmentDirName(sm.ID)
 		activeNames[name] = struct{}{}
-		s, err := OpenSegmentWithGen(filepath.Join(segDir, name), sm.TombstoneGen)
+		s, err := OpenSegmentWithCache(filepath.Join(segDir, name), sm.TombstoneGen, blockCache)
 		if err != nil {
 			closeOpened()
 			return nil, fmt.Errorf("open segment %s: %w", name, err)
@@ -117,15 +285,6 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 		}
 	}
 
-	// Rebuild pointer-free DirByKey quickly from dirs.col (without paging in hot.col / names.col).
-	dirByKey := NewKeyMap(256)
-	for _, s := range segments {
-		if err := s.PopulateDirMap(dirByKey); err != nil {
-			closeOpened()
-			return nil, err
-		}
-	}
-
 	// Open WAL fenced by MANIFEST.WALGeneration and replay committed incremental mutations.
 	wal, replayed, truncatedBytes, err := OpenWAL(filepath.Join(indexDir, "wal.log"), manifest.WALGeneration, !opts.DisableWALSync)
 	if err != nil {
@@ -134,16 +293,29 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 	}
 
 	e := &Engine{
-		dataDir:  dataDir,
-		indexDir: indexDir,
-		segDir:   segDir,
-		opts:     opts,
-		manifest: manifest,
-		extPool:  extPool,
-		wal:      wal,
-		segments: segments,
-		mem:      NewMemTable(max(len(replayed), 64)),
-		dirByKey: dirByKey,
+		dataDir:    dataDir,
+		indexDir:   indexDir,
+		segDir:     segDir,
+		opts:       opts,
+		manifest:   manifest,
+		extPool:    extPool,
+		wal:        wal,
+		segments:   segments,
+		mem:        NewMemTable(max(len(replayed), 64)),
+		blockCache: blockCache,
+		closeDone:  make(chan struct{}),
+	}
+	for _, sm := range manifest.Segments {
+		if sm.Tier2 {
+			e.tier2Sticky = true
+			break
+		}
+	}
+	if opts.LowMemoryMode {
+		e.tier2Sticky = true
+	}
+	if e.tier2Sticky {
+		e.mem.EnableInverted()
 	}
 
 	for i := range replayed {
@@ -152,6 +324,17 @@ func Open(dataDir string, opts Options) (*Engine, error) {
 			return nil, fmt.Errorf("replay wal[%d]: %w", i, err)
 		}
 	}
+
+	// A reopened index already past the threshold enters Tier 2 mode without
+	// waiting for the next write (the rebuild itself still needs a flush).
+	if !e.tier2Sticky && e.liveCountLocked() >= opts.Tier2Threshold {
+		e.tier2Sticky = true
+	}
+	if e.tier2Sticky {
+		e.mem.EnableInverted()
+	}
+
+	e.loadSnapshotMounts()
 
 	e.openStats = OpenStats{
 		ReplayedWALCount:      len(replayed),
@@ -184,6 +367,13 @@ func (e *Engine) ExtPool() *ExtPool {
 	return e.extPool
 }
 
+// BlockCache returns the shared Tier 2 block cache (never nil while open).
+func (e *Engine) BlockCache() *lsm.BlockCache {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.blockCache
+}
+
 // BeginDenseSegment flushes any pending WAL/MemTable checkpoint, reserves a segment ID and baseNodeID,
 // and returns a streaming Dense SegmentBuilder. Only one dense build may be active at a time.
 func (e *Engine) BeginDenseSegment() (*SegmentBuilder, error) {
@@ -206,16 +396,24 @@ func (e *Engine) BeginDenseSegment() (*SegmentBuilder, error) {
 	e.manifest.NextSegmentID++
 	baseNodeID := e.manifest.NextNodeID
 	e.denseBuildActive = true
+	useTier2 := e.tier2EnabledLocked()
 	e.mu.Unlock()
 
 	dir := filepath.Join(e.segDir, SegmentDirName(segID))
-	b, err := NewSegmentBuilder(dir, segID, baseNodeID, true, e.extPool)
+	var b *SegmentBuilder
+	var err error
+	if useTier2 {
+		b, err = NewTier2SegmentBuilder(dir, segID, baseNodeID, true, e.extPool)
+	} else {
+		b, err = NewSegmentBuilder(dir, segID, baseNodeID, true, e.extPool)
+	}
 	if err != nil {
 		e.mu.Lock()
 		e.denseBuildActive = false
 		e.mu.Unlock()
 		return nil, err
 	}
+	b.setBuildBudget(e.opts.BuildBudgetBytes)
 	b.onAbort = func() {
 		e.mu.Lock()
 		e.denseBuildActive = false
@@ -224,11 +422,127 @@ func (e *Engine) BeginDenseSegment() (*SegmentBuilder, error) {
 	return b, nil
 }
 
+// DefaultDenseSegmentNodes bounds how many nodes one dense segment holds, so a
+// full-volume build releases its name/inverted buffers every N nodes instead of
+// accumulating the whole volume in memory.
+const DefaultDenseSegmentNodes = 10_000_000
+
+// DefaultBuildBudgetBytes bounds one dense segment's build-time resident state.
+const DefaultBuildBudgetBytes int64 = 2 << 30
+
+// DenseWriter streams a volume into one or more dense segments, committing each
+// chunk as it fills. Parent/child references use global NodeIDs, so splitting a
+// volume across segments preserves query semantics.
+type DenseWriter struct {
+	e     *Engine
+	max   int
+	cur   *SegmentBuilder
+	metas []SegmentMeta
+}
+
+// NewDenseWriter starts a chunked dense build. max <= 0 uses
+// DefaultDenseSegmentNodes.
+func (e *Engine) NewDenseWriter(max int) (*DenseWriter, error) {
+	if max <= 0 {
+		max = e.opts.DenseSegmentNodes
+	}
+	if max <= 0 {
+		max = DefaultDenseSegmentNodes
+	}
+	b, err := e.BeginDenseSegment()
+	if err != nil {
+		return nil, err
+	}
+	return &DenseWriter{e: e, max: max, cur: b}, nil
+}
+
+// Append adds one node, rolling to a fresh segment when the current one is full.
+func (w *DenseWriter) Append(volID uint16, nodeKey uint64, parentIdx uint32, name string, flags uint16, extID uint16, size, modTime int64) (uint32, error) {
+	if w.cur == nil {
+		return 0, ErrClosed
+	}
+	if w.max > 0 && w.cur.Count() >= uint32(w.max) {
+		if err := w.roll(); err != nil {
+			return 0, err
+		}
+	}
+	return w.cur.AppendDense(volID, nodeKey, parentIdx, name, flags, extID, size, modTime)
+}
+
+// roll finishes and commits the current segment, then opens the next one.
+func (w *DenseWriter) roll() error {
+	if w.cur.Count() == 0 {
+		return nil
+	}
+	meta, err := w.cur.Finish()
+	if err != nil {
+		w.cur.Abort()
+		w.cur = nil
+		return err
+	}
+	if err := w.e.CommitSegment(meta, nil); err != nil {
+		w.cur = nil
+		return err
+	}
+	w.metas = append(w.metas, meta)
+	b, err := w.e.BeginDenseSegment()
+	if err != nil {
+		w.cur = nil
+		return err
+	}
+	w.cur = b
+	return nil
+}
+
+// Commit finishes the final segment, persists the volume cursor on it, and
+// returns the last committed segment meta.
+func (w *DenseWriter) Commit(cursor *VolumeCursor) (SegmentMeta, error) {
+	if w.cur == nil {
+		return SegmentMeta{}, ErrClosed
+	}
+	meta, err := w.cur.Finish()
+	if err != nil {
+		w.cur.Abort()
+		w.cur = nil
+		return SegmentMeta{}, err
+	}
+	if err := w.e.CommitSegment(meta, cursor); err != nil {
+		w.cur = nil
+		return SegmentMeta{}, err
+	}
+	w.metas = append(w.metas, meta)
+	w.cur = nil
+	return meta, nil
+}
+
+// Count returns the total nodes appended across committed and in-progress chunks.
+func (w *DenseWriter) Count() uint32 {
+	var n uint32
+	for _, m := range w.metas {
+		n += m.NodeCount
+	}
+	if w.cur != nil {
+		n += w.cur.Count()
+	}
+	return n
+}
+
+// Segments returns the metas committed so far, in append order.
+func (w *DenseWriter) Segments() []SegmentMeta { return w.metas }
+
+// Abort discards the in-progress segment; already committed chunks stay.
+func (w *DenseWriter) Abort() {
+	if w.cur != nil {
+		w.cur.Abort()
+		w.cur = nil
+	}
+}
+
 // CommitSegment mounts a freshly built segment and atomically records it in MANIFEST,
 // advancing WALGeneration to prevent stale WAL replay or cursor regression.
 func (e *Engine) CommitSegment(meta SegmentMeta, cursor *VolumeCursor) error {
 	segPath := filepath.Join(e.segDir, SegmentDirName(meta.ID))
-	seg, err := OpenSegmentWithGen(segPath, meta.TombstoneGen)
+	seg, err := OpenSegmentWithCache(segPath, meta.TombstoneGen, e.BlockCache())
 	if err != nil {
 		e.mu.Lock()
 		e.denseBuildActive = false
@@ -281,6 +595,10 @@ func (e *Engine) CommitSegment(meta SegmentMeta, cursor *VolumeCursor) error {
 	}
 	nextManifest.WALGeneration++
 
+	if err := e.backupManifestBeforeTier2Upgrade(nextManifest); err != nil {
+		seg.Release()
+		return err
+	}
 	if err := nextManifest.Save(filepath.Join(e.indexDir, "MANIFEST")); err != nil {
 		seg.Release()
 		return err
@@ -290,9 +608,6 @@ func (e *Engine) CommitSegment(meta SegmentMeta, cursor *VolumeCursor) error {
 	e.manifest = nextManifest
 	e.segments = append(e.segments, seg)
 	e.writeGen++
-	if err := seg.PopulateDirMap(e.dirByKey); err != nil {
-		return err
-	}
 	return e.wal.Reset(nextManifest.WALGeneration)
 }
 
@@ -303,8 +618,12 @@ func (e *Engine) ensureMemWritableLocked() {
 }
 
 func (e *Engine) resetMemLocked() {
+	inverted := e.mem.InvertedEnabled()
 	if e.memShared.Swap(false) {
 		e.mem = NewMemTable(64)
+		if inverted {
+			e.mem.EnableInverted()
+		}
 	} else {
 		e.mem.Reset()
 	}
@@ -341,7 +660,10 @@ func (e *Engine) ApplyBatch(muts []Mutation) error {
 func (e *Engine) applyMutationLocked(m Mutation) error {
 	switch m.Op {
 	case OpCreate:
-		parentIdx := e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+		parentIdx, err := e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+		if err != nil {
+			return err
+		}
 		isDir := (m.Flags & FlagDir) != 0
 
 		var nodeID uint32
@@ -354,18 +676,12 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 
 		extID := e.extPool.InternFromName(m.Name, isDir)
 		e.mem.Upsert(nodeID, m.VolID, m.NodeKey, parentIdx, m.Name, m.Flags, extID, m.Size, m.ModTime)
-		if isDir {
-			e.dirByKey.Put(m.VolID, m.NodeKey, nodeID)
-		} else {
-			e.dirByKey.Delete(m.VolID, m.NodeKey)
-		}
 
 	case OpDelete:
 		nodeID, found := e.findLiveByKeyLocked(m.VolID, m.NodeKey)
 		if !found {
 			return nil
 		}
-		e.dirByKey.Delete(m.VolID, m.NodeKey)
 		e.mem.MarkDeletedByNodeID(nodeID)
 		e.markDeletedInSegmentsLocked(nodeID)
 
@@ -386,9 +702,15 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 		}
 		parentIdx := oldNode.ParentIdx
 		if m.NewParentKey != 0 {
-			parentIdx = e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+			parentIdx, err = e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+			if err != nil {
+				return err
+			}
 		} else if m.ParentKey != 0 {
-			parentIdx = e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+			parentIdx, err = e.resolveParentIdxLocked(m.VolID, m.ParentKey, m.NodeKey)
+			if err != nil {
+				return err
+			}
 		}
 
 		isDir := (oldNode.Flags & FlagDir) != 0
@@ -410,18 +732,9 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 
 		e.markDeletedInSegmentsLocked(nodeID)
 		e.mem.Upsert(nodeID, m.VolID, m.NodeKey, parentIdx, m.Name, flags, extID, cm.Size, cm.ModTime)
-		if isDir {
-			e.dirByKey.Put(m.VolID, m.NodeKey, nodeID)
-		}
 
 	case OpMoveDir:
-		var nodeID uint32
-		var found bool
-		if id, ok := e.dirByKey.Get(m.VolID, m.NodeKey); ok {
-			nodeID, found = id, true
-		} else {
-			nodeID, found = e.findLiveByKeyLocked(m.VolID, m.NodeKey)
-		}
+		nodeID, found := e.findLiveByKeyLocked(m.VolID, m.NodeKey)
 		if !found {
 			return nil
 		}
@@ -432,10 +745,12 @@ func (e *Engine) applyMutationLocked(m Mutation) error {
 		if !ok {
 			return nil
 		}
-		newParentIdx := e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+		newParentIdx, err := e.resolveParentIdxLocked(m.VolID, m.NewParentKey, m.NodeKey)
+		if err != nil {
+			return err
+		}
 		e.markDeletedInSegmentsLocked(nodeID)
 		e.mem.Upsert(nodeID, m.VolID, m.NodeKey, newParentIdx, oldName, oldNode.Flags|FlagDir, oldNode.ExtID, oldCold.Size, oldCold.ModTime)
-		e.dirByKey.Put(m.VolID, m.NodeKey, nodeID)
 
 	case OpCursorUpdate:
 		e.manifest.SetVolumeCursor(VolumeCursor{
@@ -453,14 +768,28 @@ func (e *Engine) allocNodeIDLocked() uint32 {
 	return id
 }
 
-func (e *Engine) resolveParentIdxLocked(volID uint16, parentKey, selfKey uint64) uint32 {
+// ErrParentNotFound reports a mutation whose parent directory is absent from
+// the index, so the node must not be silently attached to the volume root.
+var ErrParentNotFound = errors.New("storage: parent directory not found")
+
+// resolveParentIdxLocked maps a parent directory key to its NodeID by looking
+// up the live node and verifying it is a directory. The mapping is never cached
+// in a process-wide table, so resident memory stays independent of dir count.
+func (e *Engine) resolveParentIdxLocked(volID uint16, parentKey, selfKey uint64) (uint32, error) {
 	if parentKey == 0 || parentKey == selfKey {
-		return RootParentIdx
+		return RootParentIdx, nil
 	}
-	if dirID, ok := e.dirByKey.Get(volID, parentKey); ok {
-		return dirID
+	nodeID, node, _, _, ok, err := e.findLiveFullByKeyLocked(volID, parentKey)
+	if err != nil {
+		return 0, err
 	}
-	return RootParentIdx
+	if !ok {
+		return 0, fmt.Errorf("%w: vol %d key %d", ErrParentNotFound, volID, parentKey)
+	}
+	if (node.Flags & FlagDir) == 0 {
+		return 0, fmt.Errorf("%w: vol %d key %d is not a directory", ErrParentNotFound, volID, parentKey)
+	}
+	return nodeID, nil
 }
 
 func (e *Engine) findLiveByKeyLocked(volID uint16, nodeKey uint64) (uint32, bool) {
@@ -515,6 +844,22 @@ func (e *Engine) findLiveFullByNodeIDLocked(nodeID uint32) (HotNode, string, Col
 		}
 	}
 	return HotNode{}, "", ColdMeta{}, false, nil
+}
+
+// DirMapLimit is the resident budget for directory-id resolution structures.
+const DirMapLimit int64 = 32 << 20
+
+// DirMapBytes reports the resident bytes used by directory-id resolution.
+// Sorted dirs.col lookups hold no per-entry memory, so this stays at zero unless
+// an older unsorted segment needed its lazy fallback map.
+func (e *Engine) DirMapBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	var total int64
+	for _, s := range e.segments {
+		total += s.dirIdxBytes()
+	}
+	return total
 }
 
 func (e *Engine) markDeletedInSegmentsLocked(nodeID uint32) {
@@ -613,10 +958,17 @@ func (e *Engine) flushLocked() error {
 		segID := nextManifest.NextSegmentID
 		nextManifest.NextSegmentID++
 		segPath := filepath.Join(e.segDir, SegmentDirName(segID))
-		builder, err := NewSegmentBuilder(segPath, segID, 0, false, e.extPool)
+		var builder *SegmentBuilder
+		var err error
+		if e.tier2EnabledLocked() {
+			builder, err = NewTier2SegmentBuilder(segPath, segID, 0, false, e.extPool)
+		} else {
+			builder, err = NewSegmentBuilder(segPath, segID, 0, false, e.extPool)
+		}
 		if err != nil {
 			return err
 		}
+		builder.setBuildBudget(e.opts.BuildBudgetBytes)
 		for i := range rows {
 			r := rows[i]
 			if err := builder.Append(r.nodeID, r.volID, r.nodeKey, r.parentIdx, r.name, r.flags, r.extID, r.size, r.modTime); err != nil {
@@ -629,7 +981,7 @@ func (e *Engine) flushLocked() error {
 			builder.Abort()
 			return err
 		}
-		newSeg, err = OpenSegmentWithGen(segPath, 0)
+		newSeg, err = OpenSegmentWithCache(segPath, 0, e.blockCache)
 		if err != nil {
 			_ = os.RemoveAll(segPath)
 			return err
@@ -682,6 +1034,10 @@ func (e *Engine) flushLocked() error {
 
 	// Atomic commit point: MANIFEST switch with incremented WALGeneration.
 	nextManifest.WALGeneration++
+	if err := e.backupManifestBeforeTier2Upgrade(nextManifest); err != nil {
+		cleanupStaged()
+		return err
+	}
 	if err := nextManifest.Save(filepath.Join(e.indexDir, "MANIFEST")); err != nil {
 		cleanupStaged()
 		return err
@@ -697,7 +1053,11 @@ func (e *Engine) flushLocked() error {
 	}
 	e.resetMemLocked()
 
-	return e.wal.Reset(nextManifest.WALGeneration)
+	if err := e.wal.Reset(nextManifest.WALGeneration); err != nil {
+		return err
+	}
+	e.maybeScheduleMaintenanceLocked()
+	return nil
 }
 
 // Compact merges all segments and MemTable into a single zero-tombstone Dense segment,
@@ -706,6 +1066,25 @@ func (e *Engine) flushLocked() error {
 func (e *Engine) Compact() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.compactLocked()
+}
+
+// compactIfIdle runs a full rebuild unless a streaming dense build owns the
+// engine; used by the background maintenance worker so it never wastes a full
+// rewrite that CommitSegment would reject.
+func (e *Engine) compactIfIdle() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return ErrClosed
+	}
+	if e.denseBuildActive {
+		return nil
+	}
+	return e.compactLocked()
+}
+
+func (e *Engine) compactLocked() error {
 	if e.closed {
 		return ErrClosed
 	}
@@ -722,13 +1101,15 @@ func (e *Engine) Compact() error {
 	if estLive == 0 {
 		nextManifest.Segments = nil
 		nextManifest.NextNodeID = 0
+		if err := e.backupManifestBeforeTier2Upgrade(nextManifest); err != nil {
+			return err
+		}
 		if err := nextManifest.Save(filepath.Join(e.indexDir, "MANIFEST")); err != nil {
 			return err
 		}
 		oldSegs := e.segments
 		e.segments = nil
 		e.manifest = nextManifest
-		e.dirByKey.Clear()
 		e.resetMemLocked()
 		for _, s := range oldSegs {
 			s.MarkForRemoval()
@@ -742,7 +1123,9 @@ func (e *Engine) Compact() error {
 	var newID uint32
 	for si, s := range e.segments {
 		keys := make([]uint64, s.Count())
-		s.PopulateLocalKeys(keys)
+		if err := s.PopulateLocalKeys(keys); err != nil {
+			return err
+		}
 		segKeys[si] = keys
 
 		for localIdx := uint32(0); localIdx < s.Count(); localIdx++ {
@@ -763,12 +1146,17 @@ func (e *Engine) Compact() error {
 	segID := nextManifest.NextSegmentID
 	nextManifest.NextSegmentID++
 	segPath := filepath.Join(e.segDir, SegmentDirName(segID))
-	builder, err := NewSegmentBuilder(segPath, segID, 0, true, e.extPool)
+	var builder *SegmentBuilder
+	var err error
+	if e.tier2EnabledLocked() {
+		builder, err = NewTier2SegmentBuilder(segPath, segID, 0, true, e.extPool)
+	} else {
+		builder, err = NewSegmentBuilder(segPath, segID, 0, true, e.extPool)
+	}
 	if err != nil {
 		return err
 	}
-	newDirByKey := NewKeyMap(max(e.dirByKey.Len(), 64))
-
+	builder.setBuildBudget(e.opts.BuildBudgetBytes)
 	remapParent := func(oldParent uint32) uint32 {
 		if oldParent == RootParentIdx {
 			return RootParentIdx
@@ -803,7 +1191,7 @@ func (e *Engine) Compact() error {
 			if !okOverride {
 				cm = diskCold
 			}
-			assignedID, err := builder.AppendDense(
+			_, err := builder.AppendDense(
 				n.VolID,
 				keys[localIdx],
 				remapParent(n.ParentIdx),
@@ -818,9 +1206,6 @@ func (e *Engine) Compact() error {
 				builder.Abort()
 				return err
 			}
-			if (n.Flags & FlagDir) != 0 {
-				newDirByKey.Put(n.VolID, keys[localIdx], assignedID)
-			}
 		}
 		cs.Close()
 	}
@@ -830,7 +1215,7 @@ func (e *Engine) Compact() error {
 		slot, _ := e.mem.GetByNodeID(nodeID)
 		cm := e.mem.ColdMetaAt(slot)
 		nk := e.mem.KeyAt(slot)
-		assignedID, err := builder.AppendDense(
+		_, err := builder.AppendDense(
 			n.VolID,
 			nk,
 			remapParent(n.ParentIdx),
@@ -844,9 +1229,6 @@ func (e *Engine) Compact() error {
 			memErr = err
 			return false
 		}
-		if (n.Flags & FlagDir) != 0 {
-			newDirByKey.Put(n.VolID, nk, assignedID)
-		}
 		return true
 	})
 	if memErr != nil {
@@ -859,7 +1241,7 @@ func (e *Engine) Compact() error {
 		builder.Abort()
 		return err
 	}
-	newSeg, err := OpenSegmentWithGen(segPath, 0)
+	newSeg, err := OpenSegmentWithCache(segPath, 0, e.blockCache)
 	if err != nil {
 		_ = os.RemoveAll(segPath)
 		return err
@@ -875,6 +1257,10 @@ func (e *Engine) Compact() error {
 	// Atomic commit point: MANIFEST switch with incremented WALGeneration.
 	nextManifest.Segments = []SegmentMeta{newMeta}
 	nextManifest.NextNodeID = newMeta.NodeCount
+	if err := e.backupManifestBeforeTier2Upgrade(nextManifest); err != nil {
+		newSeg.MarkForRemoval()
+		return err
+	}
 	if err := nextManifest.Save(filepath.Join(e.indexDir, "MANIFEST")); err != nil {
 		newSeg.MarkForRemoval()
 		return err
@@ -883,7 +1269,6 @@ func (e *Engine) Compact() error {
 	// Post-commit: switch live engine state, release old segments, then rotate WAL.
 	oldSegs := e.segments
 	e.segments = []*Segment{newSeg}
-	e.dirByKey = newDirByKey
 	e.manifest = nextManifest
 	e.writeGen++
 	e.resetMemLocked()
@@ -892,6 +1277,300 @@ func (e *Engine) Compact() error {
 		s.MarkForRemoval()
 	}
 	return e.wal.Reset(nextManifest.WALGeneration)
+}
+
+// compactionTestHook lets tests observe or interrupt background compaction at
+// a commit boundary (segment materialized, MANIFEST not yet switched). It is
+// nil in production binaries.
+var compactionTestHook func(point string)
+
+// CompactOldest merges the oldest n segments (n >= 2) into a single segment,
+// physically dropping their tombstones and rebuilding the inverted index. The
+// merge is built without holding the engine lock, so concurrent queries and
+// mutations are never blocked; the commit is skipped when the segment layout
+// changed while the merge was being built. Old segments are released through
+// their reference counts, so open snapshots keep reading them until released.
+func (e *Engine) CompactOldest(n int) error {
+	if n < 2 {
+		return nil
+	}
+
+	// Phase 1a: reserve a segment ID and pin the oldest n segments.
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return ErrClosed
+	}
+	if n > len(e.segments) {
+		e.mu.Unlock()
+		return nil
+	}
+	prefix := append([]*Segment(nil), e.segments[:n]...)
+	for _, s := range prefix {
+		s.Retain()
+	}
+	segID := e.manifest.NextSegmentID
+	e.manifest.NextSegmentID++
+	e.mu.Unlock()
+
+	// Phase 1b: capture the pinned tombstone views plus the guards used to
+	// detect concurrent deletes. keys.idx is read after the lock (segments are
+	// immutable and pinned), so writers are not blocked by the O(N) scan.
+	e.mu.RLock()
+	delBits := make([][]uint64, len(prefix))
+	genAtStart := make([]uint32, len(prefix))
+	deadAtStart := make([]uint32, len(prefix))
+	useTier2 := e.tier2Sticky || e.opts.LowMemoryMode || e.liveCountLocked() >= e.opts.Tier2Threshold
+	memSnap := e.mem.CloneSnapshot()
+	cache := e.blockCache
+	for i, s := range prefix {
+		delBits[i], _ = s.SnapshotDelBits()
+		genAtStart[i] = s.meta.TombstoneGen
+		deadAtStart[i] = s.DeadCount()
+	}
+	e.mu.RUnlock()
+
+	releasePins := func() {
+		for _, s := range prefix {
+			s.Release()
+		}
+	}
+	segKeys := make([][]uint64, len(prefix))
+	for i, s := range prefix {
+		keys := make([]uint64, s.Count())
+		if err := s.PopulateLocalKeys(keys); err != nil {
+			releasePins()
+			return err
+		}
+		segKeys[i] = keys
+	}
+
+	segPath := filepath.Join(e.segDir, SegmentDirName(segID))
+	var builder *SegmentBuilder
+	var err error
+	if useTier2 {
+		builder, err = NewTier2SegmentBuilder(segPath, segID, 0, false, e.extPool)
+	} else {
+		builder, err = NewSegmentBuilder(segPath, segID, 0, false, e.extPool)
+	}
+	if err != nil {
+		releasePins()
+		return err
+	}
+	builder.setBuildBudget(e.opts.BuildBudgetBytes)
+	abortBuild := func() {
+		builder.Abort()
+		_ = os.RemoveAll(segPath)
+		releasePins()
+	}
+
+	// Phase 2: k-way merge the pinned segments by NodeID (each segment's live
+	// NodeIDs are ascending; dense segments derive them from BaseNodeID, delta
+	// segments store them ascending). Newer segments win duplicate NodeIDs, so
+	// a rename/modify flush cannot resurrect the older row.
+	iters := make([]mergeIter, len(prefix))
+	for i, s := range prefix {
+		cs, streamErr := s.openColdStream()
+		if streamErr != nil {
+			for j := 0; j < i; j++ {
+				iters[j].cs.Close()
+			}
+			abortBuild()
+			return streamErr
+		}
+		iters[i] = mergeIter{seg: s, delBits: delBits[i], keys: segKeys[i], cs: cs}
+	}
+	closeIters := func() {
+		for i := range iters {
+			if iters[i].cs != nil {
+				iters[i].cs.Close()
+			}
+		}
+	}
+	for i := range iters {
+		if err := iters[i].advance(); err != nil {
+			closeIters()
+			abortBuild()
+			return err
+		}
+	}
+	for {
+		winner := -1
+		for i := range iters {
+			if !iters[i].ok {
+				continue
+			}
+			// Later segments (larger index) win duplicate NodeIDs.
+			if winner < 0 || iters[i].nodeID < iters[winner].nodeID ||
+				(iters[i].nodeID == iters[winner].nodeID && i > winner) {
+				winner = i
+			}
+		}
+		if winner < 0 {
+			break
+		}
+		row := iters[winner]
+		node := row.seg.NodeAt(row.localIdx)
+		cm := row.cold
+		if ov, ok := memSnap.GetColdOverride(row.nodeID); ok {
+			cm = ov
+		}
+		if appendErr := builder.Append(
+			row.nodeID,
+			node.VolID,
+			row.keys[row.localIdx],
+			node.ParentIdx,
+			string(row.seg.NameBytesAt(row.localIdx)),
+			node.Flags,
+			node.ExtID,
+			cm.Size,
+			cm.ModTime,
+		); appendErr != nil {
+			closeIters()
+			abortBuild()
+			return appendErr
+		}
+		mergedID := row.nodeID
+		// Advance the winner and drop older rows carrying the same NodeID.
+		if err := iters[winner].advance(); err != nil {
+			closeIters()
+			abortBuild()
+			return err
+		}
+		for i := range iters {
+			if i == winner {
+				continue
+			}
+			for iters[i].ok && iters[i].nodeID == mergedID {
+				if err := iters[i].advance(); err != nil {
+					closeIters()
+					abortBuild()
+					return err
+				}
+			}
+		}
+	}
+	closeIters()
+
+	newMeta, err := builder.Finish()
+	if err != nil {
+		abortBuild()
+		return err
+	}
+	newSeg, err := OpenSegmentWithCache(segPath, 0, cache)
+	if err != nil {
+		_ = os.RemoveAll(segPath)
+		releasePins()
+		return err
+	}
+
+	if compactionTestHook != nil {
+		compactionTestHook("segment-written")
+	}
+
+	// Phase 3: commit atomically if the layout is still the one we merged.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		newSeg.MarkForRemoval()
+		releasePins()
+		return ErrClosed
+	}
+	cur := e.segments
+	if len(cur) < n || cur[0] != prefix[0] || cur[n-1] != prefix[n-1] {
+		newSeg.MarkForRemoval()
+		releasePins()
+		return nil // layout changed; retry on the next maintenance pass
+	}
+	// The merged rows were read from the frozen tombstone views. If any prefix
+	// segment gained deletions after that snapshot (a concurrent delete or a
+	// flush committing tombstones), committing would resurrect those rows.
+	for i, s := range prefix {
+		if s.meta.TombstoneGen != genAtStart[i] || s.DeadCount() != deadAtStart[i] {
+			newSeg.MarkForRemoval()
+			releasePins()
+			return nil // tombstones moved; retry on the next maintenance pass
+		}
+	}
+
+	if e.extPool.Dirty() {
+		if err := e.extPool.Save(filepath.Join(e.indexDir, "ext.pool")); err != nil {
+			newSeg.MarkForRemoval()
+			releasePins()
+			return err
+		}
+	}
+
+	remaining := make([]*Segment, 0, len(cur)-n+1)
+	remaining = append(remaining, newSeg)
+	remaining = append(remaining, cur[n:]...)
+
+	nextManifest := e.manifest.Clone()
+	nextManifest.WALGeneration++
+	segMetas := make([]SegmentMeta, 0, len(nextManifest.Segments)-n+1)
+	segMetas = append(segMetas, newMeta)
+	segMetas = append(segMetas, nextManifest.Segments[n:]...)
+	nextManifest.Segments = segMetas
+	if err := e.backupManifestBeforeTier2Upgrade(nextManifest); err != nil {
+		newSeg.MarkForRemoval()
+		releasePins()
+		return err
+	}
+	if err := nextManifest.Save(filepath.Join(e.indexDir, "MANIFEST")); err != nil {
+		newSeg.MarkForRemoval()
+		releasePins()
+		return err
+	}
+
+	// Post-commit: switch engine state, then release the merged segments.
+	e.segments = remaining
+	e.manifest = nextManifest
+	if useTier2 {
+		e.tier2Sticky = true
+		e.enableMemInvertedLocked()
+	}
+	e.writeGen++
+	for _, s := range prefix {
+		s.MarkForRemoval()
+	}
+	releasePins()
+	return e.wal.Reset(nextManifest.WALGeneration)
+}
+
+// mergeIter streams one pinned segment's live rows in local-index order during
+// a tiered merge.
+type mergeIter struct {
+	seg      *Segment
+	delBits  []uint64
+	keys     []uint64
+	cs       *coldStream
+	pos      uint32
+	nodeID   uint32
+	localIdx uint32
+	cold     ColdMeta
+	ok       bool
+}
+
+// advance moves to the next live row of this segment.
+func (it *mergeIter) advance() error {
+	for it.pos < it.seg.Count() {
+		cm, err := it.cs.Next()
+		if err != nil {
+			return err
+		}
+		li := it.pos
+		it.pos++
+		if isBitSet(it.delBits, it.seg.Count(), li) {
+			continue
+		}
+		it.nodeID = it.seg.NodeIDAt(li)
+		it.localIdx = li
+		it.cold = cm
+		it.ok = true
+		return nil
+	}
+	it.ok = false
+	return nil
 }
 
 type snapSegment struct {
@@ -909,21 +1588,42 @@ func (e *Engine) AcquireSnapshot() *Snapshot {
 	if e.closed {
 		return &Snapshot{closed: true}
 	}
-	segs := make([]snapSegment, len(e.segments))
-	for i, s := range e.segments {
+	segs := make([]snapSegment, 0, len(e.segments)+len(e.snapshots))
+	for _, s := range e.segments {
 		s.Retain()
 		delBits, live := s.SnapshotDelBits()
-		segs[i] = snapSegment{
+		segs = append(segs, snapSegment{
 			seg:       s,
 			delBits:   delBits,
 			liveCount: live,
+		})
+	}
+	ranges := make([]snapshotRange, len(e.snapshots))
+	for i, m := range e.snapshots {
+		m.seg.Retain()
+		delBits, live := m.seg.SnapshotDelBits()
+		segs = append(segs, snapSegment{
+			seg:       m.seg,
+			delBits:   delBits,
+			liveCount: live,
+		})
+		ranges[i] = snapshotRange{
+			base:   m.info.BaseNodeID,
+			count:  m.info.Nodes,
+			label:  m.info.VolumeLabel,
+			volID:  m.info.VolumeID,
+			root:   m.info.RootPath,
+			export: m.info.ExportedAt,
 		}
 	}
 	e.memShared.Store(true)
 	return &Snapshot{
-		segs: segs,
-		mem:  e.mem,
-		gen:  e.writeGen,
+		segs:      segs,
+		l1Segs:    len(e.segments),
+		snapshots: ranges,
+		mem:       e.mem,
+		gen:       e.writeGen,
+		tier2:     e.tier2Sticky,
 	}
 }
 
@@ -931,12 +1631,7 @@ func (e *Engine) AcquireSnapshot() *Snapshot {
 func (e *Engine) LiveCount() uint64 {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	var total uint64
-	for _, s := range e.segments {
-		total += uint64(s.LiveCount())
-	}
-	total += uint64(e.mem.LiveCount())
-	return total
+	return e.liveCountLocked()
 }
 
 // MemTableEntryCount returns the number of entries currently buffered in MemTable.
@@ -951,6 +1646,34 @@ func (e *Engine) VolumeCursor(volID uint16) (VolumeCursor, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.manifest.GetVolumeCursor(volID)
+}
+
+// ActiveTier reports the tier the engine currently operates in: Tier2LSM once
+// the engine has latched Tier 2 or mounted any Tier 2 segment, else Tier1Mmap.
+func (e *Engine) ActiveTier() StorageTier {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.tier2Sticky {
+		return Tier2LSM
+	}
+	for _, s := range e.segments {
+		if s.tier2 {
+			return Tier2LSM
+		}
+	}
+	return Tier1Mmap
+}
+
+// BlockCacheStats returns the shared Tier 2 block cache's (used, limit) bytes.
+// Both are zero when the engine is closed.
+func (e *Engine) BlockCacheStats() (used, limit int64) {
+	e.mu.RLock()
+	cache := e.blockCache
+	e.mu.RUnlock()
+	if cache == nil {
+		return 0, 0
+	}
+	return cache.Bytes(), cache.Limit()
 }
 
 // RecommendedTier evaluates Tier 1 vs Tier 2 based on LowMemoryMode and Tier2Threshold.
@@ -995,11 +1718,29 @@ func (e *Engine) ResolvePath(nodeID uint32) (string, error) {
 // Unflushed MemTable mutations remain safely in wal.log for replay on next Open.
 func (e *Engine) Close() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.closed {
+		done := e.closeDone
+		e.mu.Unlock()
+		// A concurrent Close must observe fully released resources, not just
+		// the flag, before its caller reopens the same data directory.
+		if done != nil {
+			<-done
+		}
 		return nil
 	}
 	e.closed = true
+	done := e.closeDone
+	if done != nil {
+		defer close(done)
+	}
+	e.mu.Unlock()
+
+	// A background rebuild blocked on e.mu observes closed and returns; wait
+	// for it before releasing the segment handles and block cache underneath.
+	e.backgroundWork.Wait()
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
 	var firstErr error
 	if e.extPool.Dirty() {
@@ -1017,17 +1758,31 @@ func (e *Engine) Close() error {
 		s.Release()
 	}
 	e.segments = nil
+	e.releaseSnapshotMountsLocked()
+	if e.blockCache != nil {
+		e.blockCache.Close()
+		e.blockCache = nil
+	}
 	return firstErr
 }
 
 // Snapshot provides lock-free, race-free, point-in-time isolated read access to segments and MemTable.
 type Snapshot struct {
-	segs     []snapSegment
-	mem      *MemTable
-	gen      uint64
-	closed   bool
-	released atomic.Bool
+	segs []snapSegment
+	// l1Segs is the count of live L1 segments at the front of segs; the rest
+	// are mounted read-only snapshot packages.
+	l1Segs    int
+	snapshots []snapshotRange
+	mem       *MemTable
+	gen       uint64
+	tier2     bool
+	closed    bool
+	released  atomic.Bool
 }
+
+// Tier2Mode reports whether the engine was in Tier 2 mode when this snapshot
+// was taken. Tier 2 semantics deliberately omit the Fuzzy fallback.
+func (s *Snapshot) Tier2Mode() bool { return s != nil && s.tier2 }
 
 // Release drops segment references held by this Snapshot. Idempotent.
 func (s *Snapshot) Release() {
