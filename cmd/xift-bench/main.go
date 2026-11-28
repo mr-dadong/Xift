@@ -37,6 +37,8 @@ type report struct {
 	HeapAlloc   uint64  `json:"heap_alloc_bytes"`
 	CacheBytes  int64   `json:"cache_bytes"`
 	CacheLimit  int64   `json:"cache_limit_bytes"`
+	QueryOnly   bool    `json:"query_only,omitempty"`
+	Terms       string  `json:"terms,omitempty"`
 }
 
 func main() {
@@ -48,10 +50,11 @@ func main() {
 	cacheBytes := flag.Int64("cache-bytes", 0, "shared block cache budget in bytes (0 = 128 MB)")
 	queries := flag.Int("queries", 50, "query latency samples")
 	terms := flag.String("terms", queryTerms, "pipe-separated query terms")
+	queryOnly := flag.Bool("query-only", false, "query an existing -data-dir instead of building an index")
 	asJSON := flag.Bool("json", false, "emit a JSON report")
 	flag.Parse()
 
-	rep, err := run(*nodes, *dirs, *dataDir, *keep, *tier2, *cacheBytes, *queries, *terms)
+	rep, err := run(*nodes, *dirs, *dataDir, *keep, *tier2, *queryOnly, *cacheBytes, *queries, *terms)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[ERROR] %v\n", err)
 		os.Exit(1)
@@ -62,20 +65,36 @@ func main() {
 		_ = enc.Encode(rep)
 		return
 	}
-	fmt.Printf("Synthetic nodes:   %d files + %d dirs\n", rep.Nodes, rep.Dirs)
+	if rep.QueryOnly {
+		fmt.Printf("Mode:              query-only (existing index)\n")
+	} else {
+		fmt.Printf("Synthetic nodes:   %d files + %d dirs\n", rep.Nodes, rep.Dirs)
+	}
 	fmt.Printf("Tier:              %s\n", rep.Tier)
-	fmt.Printf("Build time:        %.2f ms\n", rep.BuildMs)
+	if !rep.QueryOnly {
+		fmt.Printf("Build time:        %.2f ms\n", rep.BuildMs)
+	}
 	fmt.Printf("Disk usage:        %.2f MiB\n", float64(rep.DiskBytes)/(1<<20))
-	fmt.Printf("Build peak RSS:    %.2f MiB\n", float64(rep.BuildRSS)/(1<<20))
+	if !rep.QueryOnly {
+		fmt.Printf("Build peak RSS:    %.2f MiB\n", float64(rep.BuildRSS)/(1<<20))
+	}
 	fmt.Printf("Cold start:        %.2f ms\n", rep.ColdStartMs)
 	fmt.Printf("Query p50/p95/p99: %.2f / %.2f / %.2f ms (%d samples)\n", rep.QueryP50Ms, rep.QueryP95Ms, rep.QueryP99Ms, rep.QueryCount)
 	fmt.Printf("Query RSS:         %.2f MiB (HeapAlloc %.2f MiB)\n", float64(rep.QueryRSS)/(1<<20), float64(rep.HeapAlloc)/(1<<20))
 	fmt.Printf("Block cache:       %.2f / %.2f MiB\n", float64(rep.CacheBytes)/(1<<20), float64(rep.CacheLimit)/(1<<20))
 }
 
-func run(nodes, dirs int, dataDir string, keep, tier2 bool, cacheBytes int64, querySamples int, termList string) (report, error) {
+func run(nodes, dirs int, dataDir string, keep, tier2, queryOnly bool, cacheBytes int64, querySamples int, termList string) (report, error) {
 	var rep report
-	if nodes <= 0 {
+	rep.QueryOnly = queryOnly
+	if queryOnly {
+		if dataDir == "" {
+			return rep, fmt.Errorf("-query-only requires -data-dir")
+		}
+		if info, err := os.Stat(dataDir); err != nil || !info.IsDir() {
+			return rep, fmt.Errorf("-query-only data dir %q is not a directory", dataDir)
+		}
+	} else if nodes <= 0 {
 		return rep, fmt.Errorf("-nodes must be positive")
 	}
 	if dataDir == "" {
@@ -98,72 +117,22 @@ func run(nodes, dirs int, dataDir string, keep, tier2 bool, cacheBytes int64, qu
 		BlockCacheBytes: cacheBytes,
 	}
 
-	buildStart := time.Now()
-	store, err := storage.Open(dataDir, opts)
-	if err != nil {
-		return rep, fmt.Errorf("open index: %w", err)
-	}
-	builder, err := store.BeginDenseSegment()
-	if err != nil {
-		_ = store.Close()
-		return rep, fmt.Errorf("begin dense segment: %w", err)
-	}
-
-	counts := syntheticCounts{Dirs: dirs, Files: nodes}
-	total := counts.totalNodes()
-	startMTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
-	var appendErr error
-	seen := 0
-	streamSynthetic(counts, startMTime, func(row syntheticRow) {
-		if appendErr != nil {
-			return
+	if !queryOnly {
+		if err := buildIndex(dataDir, opts, nodes, dirs, &rep); err != nil {
+			return rep, err
 		}
-		parentID := uint32(0)
-		if row.ParentKey > 0 {
-			parentID = uint32(row.ParentKey - 1)
-		}
-		var flags uint16
-		if row.IsDir {
-			flags = storage.FlagDir
-		}
-		if _, appendErr = builder.AppendDense(1, row.NodeKey, parentID, row.Name, flags, 0, row.Size, row.ModTime); appendErr != nil {
-			return
-		}
-		seen++
-		if seen%1_000_000 == 0 {
-			fmt.Fprintf(os.Stderr, "[bench] indexed %d/%d nodes\n", seen, total)
-		}
-	})
-	if appendErr != nil {
-		builder.Abort()
-		_ = store.Close()
-		return rep, fmt.Errorf("append: %w", appendErr)
 	}
-	meta, err := builder.Finish()
-	if err != nil {
-		builder.Abort()
-		_ = store.Close()
-		return rep, fmt.Errorf("finish segment: %w", err)
-	}
-	if err := store.CommitSegment(meta, nil); err != nil {
-		_ = store.Close()
-		return rep, fmt.Errorf("commit segment: %w", err)
-	}
-	rep.BuildMs = float64(time.Since(buildStart).Microseconds()) / 1000.0
-	rep.BuildRSS = residentBytes()
-	rep.DiskBytes = dirSize(dataDir)
-	rep.Tier = store.ActiveTier().String()
-	if err := store.Close(); err != nil {
-		return rep, fmt.Errorf("close after build: %w", err)
-	}
+	rep.Terms = termList
 
 	coldStart := time.Now()
-	store, err = storage.Open(dataDir, opts)
+	store, err := storage.Open(dataDir, opts)
 	if err != nil {
 		return rep, fmt.Errorf("cold open: %w", err)
 	}
 	defer store.Close()
 	rep.ColdStartMs = float64(time.Since(coldStart).Microseconds()) / 1000.0
+	rep.Tier = store.ActiveTier().String()
+	rep.DiskBytes = dirSize(dataDir)
 
 	qe := query.NewEngine(store)
 	ctx := context.Background()
@@ -201,9 +170,70 @@ func run(nodes, dirs int, dataDir string, keep, tier2 bool, cacheBytes int64, qu
 	rep.HeapAlloc = ms.HeapAlloc
 	rep.QueryRSS = residentBytes()
 	rep.CacheBytes, rep.CacheLimit = store.BlockCacheStats()
-	rep.Nodes = nodes
-	rep.Dirs = dirs
+	if !queryOnly {
+		rep.Nodes = nodes
+		rep.Dirs = dirs
+	}
 	return rep, nil
+}
+
+// buildIndex streams a synthetic corpus into a fresh dense segment and fills the
+// build metrics of rep.
+func buildIndex(dataDir string, opts storage.Options, nodes, dirs int, rep *report) error {
+	buildStart := time.Now()
+	store, err := storage.Open(dataDir, opts)
+	if err != nil {
+		return fmt.Errorf("open index: %w", err)
+	}
+	builder, err := store.BeginDenseSegment()
+	if err != nil {
+		_ = store.Close()
+		return fmt.Errorf("begin dense segment: %w", err)
+	}
+
+	counts := syntheticCounts{Dirs: dirs, Files: nodes}
+	total := counts.totalNodes()
+	startMTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()
+	var appendErr error
+	seen := 0
+	streamSynthetic(counts, startMTime, func(row syntheticRow) {
+		if appendErr != nil {
+			return
+		}
+		parentID := uint32(0)
+		if row.ParentKey > 0 {
+			parentID = uint32(row.ParentKey - 1)
+		}
+		var flags uint16
+		if row.IsDir {
+			flags = storage.FlagDir
+		}
+		if _, appendErr = builder.AppendDense(1, row.NodeKey, parentID, row.Name, flags, 0, row.Size, row.ModTime); appendErr != nil {
+			return
+		}
+		seen++
+		if seen%1_000_000 == 0 {
+			fmt.Fprintf(os.Stderr, "[bench] indexed %d/%d nodes\n", seen, total)
+		}
+	})
+	if appendErr != nil {
+		builder.Abort()
+		_ = store.Close()
+		return fmt.Errorf("append: %w", appendErr)
+	}
+	meta, err := builder.Finish()
+	if err != nil {
+		builder.Abort()
+		_ = store.Close()
+		return fmt.Errorf("finish segment: %w", err)
+	}
+	if err := store.CommitSegment(meta, nil); err != nil {
+		_ = store.Close()
+		return fmt.Errorf("commit segment: %w", err)
+	}
+	rep.BuildMs = float64(time.Since(buildStart).Microseconds()) / 1000.0
+	rep.BuildRSS = residentBytes()
+	return store.Close()
 }
 
 func splitTerms(s string) []string {
